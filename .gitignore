@@ -1,0 +1,19 @@
+# Environments
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Excel files and temp locks
+*.xlsx
+.~lock.*
+
+# Large documents
+*.xml
+*.zip
+
+# Virtual Environment
+.venv/
+venv/
