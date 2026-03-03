@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import date
 
 class ApplicationMaster(BaseModel):
@@ -8,6 +8,7 @@ class ApplicationMaster(BaseModel):
     app_number: str
     app_kind_code: Optional[str] = None
     app_date: Optional[date] = None
+    extra_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 class DocumentMaster(BaseModel):
     pub_doc_id: str
@@ -21,6 +22,7 @@ class DocumentMaster(BaseModel):
     is_representative: Optional[bool] = None
     is_grant: bool = False
     exchange_status: str
+    extra_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 class PriorityClaim(BaseModel):
     format_type: str

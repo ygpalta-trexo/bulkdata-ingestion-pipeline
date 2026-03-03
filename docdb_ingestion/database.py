@@ -18,6 +18,21 @@ class DatabaseManager:
 
     def init_schema(self):
         with self.conn.cursor() as cur:
+            # Table 0: Delivery Files (File lifecycle state machine)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS delivery_files (
+                    file_id BIGINT PRIMARY KEY,
+                    product_id INT,
+                    delivery_id INT,
+                    filename VARCHAR(500),
+                    status VARCHAR(20) DEFAULT 'PENDING',
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_files (status);
+            """)
+            
             # Table 1: Application Master (NEW ROOT)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS application_master (
@@ -26,6 +41,7 @@ class DatabaseManager:
                     app_number VARCHAR(50),
                     app_kind_code VARCHAR(5),
                     app_date DATE,
+                    extra_data JSONB DEFAULT '{}'::jsonb,
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
@@ -44,6 +60,7 @@ class DatabaseManager:
                     is_representative BOOLEAN,
                     is_grant BOOLEAN DEFAULT FALSE,
                     exchange_status VARCHAR(2),
+                    extra_data JSONB DEFAULT '{}'::jsonb,
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
@@ -155,6 +172,8 @@ class DatabaseManager:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
                     filename TEXT PRIMARY KEY,
+                    main_zip_id INTEGER,
+                    main_zip_filename TEXT,
                     status TEXT,
                     processed_at TIMESTAMP DEFAULT NOW()
                 );
@@ -202,13 +221,17 @@ class DatabaseManager:
             res = cur.fetchone()
             return res and res['status'] == 'COMPLETED'
 
-    def mark_file_started(self, filename: str):
+    def mark_file_started(self, filename: str, main_zip_id: int = None, main_zip_filename: str = None):
         with self.conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO ingestion_checkpoints (filename, status, processed_at)
-                VALUES (%s, 'STARTED', NOW())
-                ON CONFLICT (filename) DO UPDATE SET status = 'STARTED', processed_at = NOW();
-            """, (filename,))
+                INSERT INTO ingestion_checkpoints (filename, main_zip_id, main_zip_filename, status, processed_at)
+                VALUES (%s, %s, %s, 'STARTED', NOW())
+                ON CONFLICT (filename) DO UPDATE SET 
+                    status = 'STARTED', 
+                    main_zip_id = EXCLUDED.main_zip_id,
+                    main_zip_filename = EXCLUDED.main_zip_filename,
+                    processed_at = NOW();
+            """, (filename, main_zip_id, main_zip_filename))
             self.conn.commit()
 
     def mark_file_completed(self, filename: str):
@@ -219,25 +242,65 @@ class DatabaseManager:
             """, (filename,))
             self.conn.commit()
             
+    # --- Bulk Delivery Tracking Methods ---
+    def sync_delivery_files(self, product_id: int, delivery_id: int, files_data: List[dict]):
+        """Persist newly discovered files from the API into our state tracking machine."""
+        with self.conn.cursor() as cur:
+            for f in files_data:
+                cur.execute("""
+                    INSERT INTO delivery_files (file_id, product_id, delivery_id, filename, status)
+                    VALUES (%s, %s, %s, %s, 'PENDING')
+                    ON CONFLICT (file_id) DO NOTHING;
+                """, (f['file_id'], product_id, delivery_id, f['filename']))
+            self.conn.commit()
+            
+    def get_actionable_files(self, product_id: int, delivery_id: int) -> List[dict]:
+        """Fetch files that need processing (PENDING or partially complete)."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM delivery_files 
+                WHERE product_id = %s AND delivery_id = %s 
+                  AND status NOT IN ('COMPLETED', 'FAILED')
+                ORDER BY file_id ASC;
+            """, (product_id, delivery_id))
+            return [dict(row) for row in cur.fetchall()]
+            
+    def update_file_status(self, file_id: int, status: str, error_message: str = None):
+        """Transition file state, useful for the pipeline state machine."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE delivery_files 
+                SET status = %s, error_message = %s, updated_at = NOW()
+                WHERE file_id = %s;
+            """, (status, error_message, file_id))
+            self.conn.commit()
+
     def bulk_upsert_safe(self, documents: List[ExchangeDocument]):
          if not documents:
             return
          
          with self.conn.cursor() as cur:
             for doc in documents:
+                import json
+                
+                # Setup extra data variables for SQL
+                doc_dict = doc.app_master.model_dump()
+                doc_dict['extra_data'] = json.dumps(doc.app_master.extra_data) if doc.app_master.extra_data else '{}'
+                
                 # 1. Upsert Application Master (Root)
                 cur.execute("""
                     INSERT INTO application_master (
-                        app_doc_id, app_country, app_number, app_kind_code, app_date
+                        app_doc_id, app_country, app_number, app_kind_code, app_date, extra_data
                     ) VALUES (
-                        %(app_doc_id)s, %(app_country)s, %(app_number)s, %(app_kind_code)s, %(app_date)s
+                        %(app_doc_id)s, %(app_country)s, %(app_number)s, %(app_kind_code)s, %(app_date)s, %(extra_data)s::jsonb
                     ) ON CONFLICT (app_doc_id) DO UPDATE SET
                         app_country = EXCLUDED.app_country,
                         app_number = EXCLUDED.app_number,
                         app_kind_code = EXCLUDED.app_kind_code,
                         app_date = EXCLUDED.app_date,
+                        extra_data = EXCLUDED.extra_data,
                         updated_at = NOW()
-                """, doc.app_master.model_dump())
+                """, doc_dict)
 
                 pub_doc_id = doc.pub_master.pub_doc_id
                 
@@ -249,16 +312,19 @@ class DatabaseManager:
                     # It's a pure delete, we're done here
                     continue
                 
+                pub_dict = doc.pub_master.model_dump()
+                pub_dict['extra_data'] = json.dumps(doc.pub_master.extra_data) if doc.pub_master.extra_data else '{}'
+                
                 # 3. Insert Document Master
                 cur.execute("""
                     INSERT INTO document_master (
                         pub_doc_id, app_doc_id, country, doc_number, kind_code, extended_kind, 
-                        date_publ, family_id, is_representative, is_grant, exchange_status
+                        date_publ, family_id, is_representative, is_grant, exchange_status, extra_data
                     ) VALUES (
                         %(pub_doc_id)s, %(app_doc_id)s, %(country)s, %(doc_number)s, %(kind_code)s, %(extended_kind)s,
-                        %(date_publ)s, %(family_id)s, %(is_representative)s, %(is_grant)s, %(exchange_status)s
+                        %(date_publ)s, %(family_id)s, %(is_representative)s, %(is_grant)s, %(exchange_status)s, %(extra_data)s::jsonb
                     )
-                """, doc.pub_master.model_dump())
+                """, pub_dict)
 
                 # 4. Insert Priorities
                 if doc.priorities:

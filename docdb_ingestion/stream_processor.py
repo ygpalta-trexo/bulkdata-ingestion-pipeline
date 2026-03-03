@@ -32,6 +32,35 @@ def parse_date(date_str: Optional[str]) -> Optional[str]:
 def text(node: Optional[ET.Element]) -> Optional[str]:
     return node.text if node is not None else None
 
+def xml_to_dict(node: Optional[ET.Element]) -> Any:
+    if node is None:
+        return None
+    
+    result = {}
+    if node.attrib:
+        result.update({k: v for k, v in node.attrib.items()})
+    
+    for child in node:
+        child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        child_dict = xml_to_dict(child)
+        
+        if child_tag in result:
+            if type(result[child_tag]) is list:
+                result[child_tag].append(child_dict)
+            else:
+                result[child_tag] = [result[child_tag], child_dict]
+        else:
+            result[child_tag] = child_dict
+            
+    text_content = node.text.strip() if node.text and node.text.strip() else None
+    if text_content:
+        if not result:
+            return text_content
+        else:
+            result['#text'] = text_content
+            
+    return result if result else None
+
 def process_zip_file(zip_path: str, dtd_dir: Optional[str] = None) -> Iterator[ExchangeDocument]:
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -361,6 +390,37 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
                  source=None,
                  content=txt.text.strip()
              ))
+             
+    # Clean up successfully parsed blocks to leave only unhandled data
+    tags_to_remove = [
+        "exch:application-reference",
+        "exch:priority-claims",
+        "exch:parties",
+        "exch:designation-epc",
+        "exch:designation-pct",
+        "exch:patent-classifications",
+        "exch:references-cited",
+        "exch:dates-of-public-availability",
+        "exch:abstract",
+        "exch:invention-title"
+    ]
+    for block_tag in tags_to_remove:
+        for node in elem.findall(f".//{block_tag}", namespaces=NS):
+            if node.getparent() is not None:
+                node.getparent().remove(node)
+
+    # Remove known root attributes
+    for attr in ['country', 'doc-number', 'kind', 'date-publ', 'doc-id', 'family-id', 'status', 'system']:
+        elem.attrib.pop(attr, None)
+
+    # Convert what's left in the root element to a dictionary
+    extra_data = xml_to_dict(elem)
+    if extra_data is None:
+        extra_data = {}
+    elif isinstance(extra_data, str):
+        extra_data = {"#text": extra_data}
+        
+    pub_master.extra_data = extra_data
 
     return ExchangeDocument(
         app_master=app_master,
