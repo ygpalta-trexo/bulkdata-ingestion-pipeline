@@ -29,7 +29,9 @@ docdb_ingestion/
 ├── export_sample_excel.py# Command line utility to extract PM-friendly Excel snapshots
 ├── query_biblio.py       # Developer utility script for querying the structured database
 ├── reset_db.py           # Utility to wipe the schema completely
-└── setup_db.py           # Utility to initialize the empty schema
+├── setup_db.py           # Utility to initialize the empty schema
+├── process_folder.py     # Process ZIP files directly from a folder (for testing/debugging)
+└── test_process_folder.py# Test script demonstrating process_folder.py usage
 ```
 
 ## Setup & Installation
@@ -90,6 +92,37 @@ The pipeline manages a 2-tier master architecture (`application_master` and `doc
 8. `abstracts`: Multi-lingual document abstracts.
 9. `designation_of_states`: Granular tracking of EPC and PCT state designations (typically from WIPO/EP patent families).
 10. `citation_passage_mapping`: Deep linking of citations to specific contextual passages within the referenced documents.
+
+## Processing Files from a Folder
+
+For development, testing, or processing manually downloaded files, you can use `process_folder.py` to process ZIP files directly from any folder without requiring the index.xml parsing:
+
+```bash
+# Dry run - process files but don't save to database
+python process_folder.py /path/to/folder/with/zips --dry-run --limit 3
+
+# Process and save to database
+python process_folder.py /path/to/folder --dsn "postgresql://user:pass@host/db"
+
+# Process and save detailed results to JSON
+python process_folder.py /path/to/folder --output-json results.json
+
+# Process with verbose logging
+python process_folder.py /path/to/folder --dry-run --verbose
+```
+
+**Use Cases:**
+- Testing individual ZIP files before full pipeline runs
+- Processing manually downloaded or extracted files
+- Debugging specific documents or data issues
+- Development workflows where you want to modify data and reprocess
+
+**Features:**
+- Recursively finds all `.zip` files in the specified folder
+- Automatic DTD directory detection (looks for `DTDS` folder alongside ZIPs)
+- Comprehensive error handling and reporting
+- JSON export of processing results and statistics
+- Shows unhandled `extra_data` fields found during processing
 
 ## Generating Excel Exports
 You can use the built-in export tool to extract rich subsets of the database to flattened Excel sheets for stakeholder review:

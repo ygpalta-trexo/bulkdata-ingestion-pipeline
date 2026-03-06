@@ -2,6 +2,28 @@ import psycopg
 from psycopg.rows import dict_row
 from typing import List
 from .models import ExchangeDocument
+import os
+from dotenv import load_dotenv
+
+def get_dsn_from_env() -> str:
+    """
+    Construct DSN explicitly from .env components to prevent 
+    stray DATABASE_URL environment variables in the user's shell 
+    from overriding the intended environment mapping.
+    """
+    load_dotenv(override=True)
+    
+    user = os.getenv("POSTGRES_USER", "postgres")
+    password = os.getenv("POSTGRES_PASSWORD", "password")
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    dbname = os.getenv("POSTGRES_DB")
+
+    if dbname:
+        return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+    
+    # Safe fallback if .env doesn't specify POSTGRES_DB
+    return os.getenv("DATABASE_URL", f"postgresql://{user}:{password}@{host}:{port}/docdb")
 
 class DatabaseManager:
     def __init__(self, dsn: str):
@@ -59,7 +81,9 @@ class DatabaseManager:
                     family_id VARCHAR(50),
                     is_representative BOOLEAN,
                     is_grant BOOLEAN DEFAULT FALSE,
-                    exchange_status VARCHAR(2),
+                    originating_office VARCHAR(10),
+                    date_added_docdb DATE,
+                    date_last_exchange DATE,
                     extra_data JSONB DEFAULT '{}'::jsonb,
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
@@ -304,12 +328,12 @@ class DatabaseManager:
 
                 pub_doc_id = doc.pub_master.pub_doc_id
                 
-                # 2. Delete existing Document Master - CASCADE handles all dependent child rows (Parties, Citations, etc.)
-                # This ensures we wipe-and-load the specific publication state cleanly.
+                # 2. Delete existing document (CASCADE removes all child rows)
                 cur.execute("DELETE FROM document_master WHERE pub_doc_id = %s", (pub_doc_id,))
                 
-                if doc.pub_master.exchange_status in ('D', 'DV', 'V'):
-                    # It's a pure delete, we're done here
+                # Route based on operation: 'D'/'DV'/'V' are Delete instructions
+                if doc.operation.upper() in ('D', 'DV', 'V'):
+                    logger.info(f"Delete operation for {pub_doc_id} — removed from DB.")
                     continue
                 
                 pub_dict = doc.pub_master.model_dump()
@@ -319,10 +343,12 @@ class DatabaseManager:
                 cur.execute("""
                     INSERT INTO document_master (
                         pub_doc_id, app_doc_id, country, doc_number, kind_code, extended_kind, 
-                        date_publ, family_id, is_representative, is_grant, exchange_status, extra_data
+                        date_publ, family_id, is_representative, is_grant,
+                        originating_office, date_added_docdb, date_last_exchange, extra_data
                     ) VALUES (
                         %(pub_doc_id)s, %(app_doc_id)s, %(country)s, %(doc_number)s, %(kind_code)s, %(extended_kind)s,
-                        %(date_publ)s, %(family_id)s, %(is_representative)s, %(is_grant)s, %(exchange_status)s, %(extra_data)s::jsonb
+                        %(date_publ)s, %(family_id)s, %(is_representative)s, %(is_grant)s,
+                        %(originating_office)s, %(date_added_docdb)s, %(date_last_exchange)s, %(extra_data)s::jsonb
                     )
                 """, pub_dict)
 

@@ -48,7 +48,7 @@ class PipelineOrchestrator:
         self.db.sync_delivery_files(self.product_id, self.delivery_id, files)
         logger.info(f"Successfully synchronized {len(files)} files to the database.")
 
-    def run(self):
+    def run(self, start_index=1):
         """Main execution loop for downloading, extracting, and processing files."""
         logger.info("Starting pipeline execution loop...")
         
@@ -56,6 +56,15 @@ class PipelineOrchestrator:
         if not actionable_files:
             logger.info("No actionable files found. Pipeline is idle.")
             return
+            
+        # Apply start-index (1-based index)
+        if start_index > 1:
+            skip_count = start_index - 1
+            if skip_count >= len(actionable_files):
+                logger.warning(f"start_index {start_index} is greater than total actionable files ({len(actionable_files)}). Nothing to process.")
+                return
+            actionable_files = actionable_files[skip_count:]
+            logger.info(f"Skipped first {skip_count} files. Starting at index {start_index} out of total files.")
             
         logger.info(f"Found {len(actionable_files)} files to process.")
         
@@ -105,7 +114,17 @@ class PipelineOrchestrator:
                     self.db.update_file_status(file_id, 'PARSING')
                     
                     # Find all internal ZIPs. The structure is usually Root/DOC/something.zip
-                    internal_zips = glob.glob(os.path.join(extract_dir, '**/*.zip'), recursive=True)
+                    internal_zips_raw = glob.glob(os.path.join(extract_dir, '**/*.zip'), recursive=True)
+                    
+                    # Skill rule: Mandatory ZIP processing order to handle re-keys and prevent pk collisions
+                    def zip_sort_priority(filename):
+                        base = os.path.basename(filename)
+                        if 'DeleteRekey' in base: return 1
+                        if 'CreateDelete' in base: return 2
+                        if 'Amend' in base: return 3
+                        return 4 # Unknowns or others at the end
+                        
+                    internal_zips = sorted(internal_zips_raw, key=zip_sort_priority)
                     
                     dtd_dir = None
                     for d in ['Root/DTDS', 'DTDS', 'Schema']:
@@ -163,6 +182,7 @@ class PipelineOrchestrator:
 def main():
     import sys
     from datetime import datetime
+    import argparse
     
     # Setup Date-wise logging
     log_dir = os.path.join(os.getcwd(), 'logs', datetime.now().strftime('%Y-%m-%d'))
@@ -179,20 +199,23 @@ def main():
     )
     logger.info(f"Logging initialized. Outputting to {log_file}")
     
-    if len(sys.argv) < 2:
-        print("Usage: python -m docdb_ingestion.pipeline [sync|run]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Run the EPO Pipeline Orchestrator")
+    parser.add_argument("command", choices=["sync", "run"], help="Command to execute")
+    parser.add_argument("--start-index", type=int, default=1, help="1-based index to point pipeline at the Nth actionable file")
+    
+    args = parser.parse_args()
         
-    cmd = sys.argv[1]
+    cmd = args.command
+    logger.info(f"Initialized Pipeline Orchestrator for command: {cmd}")
+    
     orchestrator = PipelineOrchestrator()
     
     if cmd == 'sync':
         orchestrator.sync()
     elif cmd == 'run':
-        orchestrator.run()
+        orchestrator.run(start_index=args.start_index)
     else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
+        logger.error(f"Unknown command: {cmd}")
 
 if __name__ == '__main__':
     main()

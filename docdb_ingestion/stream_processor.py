@@ -32,8 +32,24 @@ def parse_date(date_str: Optional[str]) -> Optional[str]:
 def text(node: Optional[ET.Element]) -> Optional[str]:
     return node.text if node is not None else None
 
-def xml_to_dict(node: Optional[ET.Element]) -> Any:
+def xml_to_dict(node: Optional[ET.Element], max_depth: int = 50, _current_depth: int = 0) -> Any:
+    """
+    Recursively convert XML element to dict, capturing all nesting levels.
+    
+    Args:
+        node: XML element to convert
+        max_depth: Maximum nesting depth to prevent infinite recursion (default 50)
+        _current_depth: Internal tracking of current recursion depth
+    
+    Returns:
+        Dictionary representation of XML, preserving all data at any nesting level.
+        Returns None if node is None, string if text-only content, dict otherwise.
+    """
     if node is None:
+        return None
+    
+    if _current_depth > max_depth:
+        logger.warning(f"xml_to_dict: Max nesting depth ({max_depth}) exceeded. Stopping recursion.")
         return None
     
     result = {}
@@ -41,8 +57,18 @@ def xml_to_dict(node: Optional[ET.Element]) -> Any:
         result.update({k: v for k, v in node.attrib.items()})
     
     for child in node:
-        child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-        child_dict = xml_to_dict(child)
+        # Handle potential lxml element corruption
+        try:
+            if hasattr(child, 'tag') and isinstance(child.tag, str):
+                child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            else:
+                logger.warning(f"Skipping child with invalid tag: {type(child.tag)}")
+                continue
+        except (TypeError, AttributeError) as e:
+            logger.warning(f"Skipping child due to tag access error: {e}")
+            continue
+            
+        child_dict = xml_to_dict(child, max_depth=max_depth, _current_depth=_current_depth + 1)
         
         if child_tag in result:
             if type(result[child_tag]) is list:
@@ -51,6 +77,12 @@ def xml_to_dict(node: Optional[ET.Element]) -> Any:
                 result[child_tag] = [result[child_tag], child_dict]
         else:
             result[child_tag] = child_dict
+        
+        # Capture tail text: text appearing after a child's closing tag.
+        # e.g. <root><child/>tail text here</root> — 'tail text here' is child.tail
+        if child.tail and child.tail.strip():
+            tail_key = f"{child_tag}#tail"
+            result[tail_key] = child.tail.strip()
             
     text_content = node.text.strip() if node.text and node.text.strip() else None
     if text_content:
@@ -60,6 +92,42 @@ def xml_to_dict(node: Optional[ET.Element]) -> Any:
             result['#text'] = text_content
             
     return result if result else None
+
+def prune_dict(d: Any, global_keys: set, context_keys: dict = None, current_parent: str = None) -> Any:
+    """
+    Recursively removes specific keys from a dictionary and all its nested dictionaries/lists.
+    - global_keys: set of keys to remove anywhere they appear
+    - context_keys: dict mapping a parent_key -> set(child_keys_to_remove). 
+      (e.g., if parent is 'publication-reference', only remove 'document-id' but keep others).
+    Also removes empty wrappers (dicts or lists that become empty after pruning).
+    """
+    if context_keys is None:
+        context_keys = {}
+        
+    if isinstance(d, dict):
+        cleaned = {}
+        for k, v in d.items():
+            # Check global removal
+            if k in global_keys:
+                continue
+            
+            # Check contextual removal (e.g. are we currently inside 'publication-reference' and is 'k' == 'document-id'?)
+            if current_parent in context_keys and k in context_keys[current_parent]:
+                continue
+                
+            pruned_v = prune_dict(v, global_keys, context_keys, current_parent=k)
+            if pruned_v is not None and pruned_v != {} and pruned_v != []:
+                cleaned[k] = pruned_v
+        return cleaned if cleaned else None
+    elif isinstance(d, list):
+        cleaned_list = []
+        for item in d:
+            pruned_item = prune_dict(item, global_keys, context_keys, current_parent=current_parent)
+            if pruned_item is not None and pruned_item != {} and pruned_item != []:
+                cleaned_list.append(pruned_item)
+        return cleaned_list if cleaned_list else None
+    else:
+        return d
 
 def process_zip_file(zip_path: str, dtd_dir: Optional[str] = None) -> Iterator[ExchangeDocument]:
     try:
@@ -97,8 +165,8 @@ def parse_xml_file(xml_path: str) -> Iterator[ExchangeDocument]:
         xml_path, 
         events=("end",), 
         tag=f"{{{NS['exch']}}}exchange-document",
-        load_dtd=True,
-        no_network=True
+        load_dtd=True,   # Must be True to resolve EPO-specific entities (&delta;, &bgr; etc)
+        no_network=True  # DTDs are copied to the same temp dir as the XML by process_zip_file
     )
     
     for event, elem in context:
@@ -115,7 +183,18 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     pub_doc_id = elem.get('doc-id')
     family_id = elem.get('family-id')
     status = elem.get('status', 'C')
-    
+
+    # Skill rule: CV (Create Void) and DV (Delete Void) are bare identifier stubs
+    # with NO doc-id. They represent withdrawn publications and must be skipped
+    # unless the user explicitly wants to track withdrawn status.
+    if status.upper() in ('CV', 'DV'):
+        logger.debug(f"Skipping void document (status={status}): {country}{doc_number}{kind}")
+        return ExchangeDocument(
+            app_master=ApplicationMaster(app_doc_id=f"VOID_{country}{doc_number}", app_country=country, app_number=doc_number),
+            pub_master=DocumentMaster(pub_doc_id=f"VOID_{country}{doc_number}{kind}", app_doc_id=f"VOID_{country}{doc_number}", country=country, doc_number=doc_number, kind_code=kind),
+            operation='SKIP',
+        )
+
     if not pub_doc_id:
         pub_doc_id = f"{country}{doc_number}{kind}"
 
@@ -127,9 +206,14 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     for grant_tag in elem.findall(".//exch:dates-of-public-availability/exch:printed-with-grant", namespaces=NS):
         is_grant = True
         break
-    
-    app_master = None
-    is_rep = False
+
+    # Read is-representative and metadata from the ROOT exchange-document element.
+    # EPO places these as direct attributes on <exchange-document is-representative="YES|NO">.
+    # This is the canonical source (more reliable than from the nested application-reference child).
+    is_rep = (elem.get('is-representative', 'NO').upper() == 'YES')
+    originating_office = elem.get('originating-office')
+    date_added_docdb = parse_date(elem.get('date-added-docdb'))
+    date_last_exchange = parse_date(elem.get('date-of-last-exchange'))
     
     # Extract Application Master (Root)
     # NOTE: child tags like <document-id>, <country>, <doc-number>, <kind>, <date>
@@ -138,8 +222,7 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
         format_type = app_node.get('data-format', '')
         if format_type == 'docdb':
             app_doc_id = app_node.get('doc-id')
-            if app_node.get('is-representative') == 'YES':
-                is_rep = True
+            # NOTE: is-representative is now read directly from the root exchange-document element.
             
             # Try bare tag first (most DOCDB XML), then namespaced as fallback
             doc_id_node = app_node.find("document-id")
@@ -181,15 +264,17 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
         
     pub_master = DocumentMaster(
         pub_doc_id=pub_doc_id,
-        app_doc_id=app_master.app_doc_id, # Link foreign key back to root application
+        app_doc_id=app_master.app_doc_id,
         country=country,
         doc_number=doc_number,
         kind_code=kind,
         date_publ=parse_date(date_publ),
         family_id=family_id,
-        exchange_status=status,
         is_representative=is_rep,
-        is_grant=is_grant
+        is_grant=is_grant,
+        originating_office=originating_office,
+        date_added_docdb=date_added_docdb,
+        date_last_exchange=date_last_exchange,
     )
 
     priorities = []
@@ -390,41 +475,91 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
                  source=None,
                  content=txt.text.strip()
              ))
-             
-    # Clean up successfully parsed blocks to leave only unhandled data
-    tags_to_remove = [
-        "exch:application-reference",
-        "exch:priority-claims",
-        "exch:parties",
-        "exch:designation-epc",
-        "exch:designation-pct",
-        "exch:patent-classifications",
-        "exch:references-cited",
-        "exch:dates-of-public-availability",
-        "exch:abstract",
-        "exch:invention-title"
-    ]
-    for block_tag in tags_to_remove:
-        for node in elem.findall(f".//{block_tag}", namespaces=NS):
-            if node.getparent() is not None:
-                node.getparent().remove(node)
-
-    # Remove known root attributes
-    for attr in ['country', 'doc-number', 'kind', 'date-publ', 'doc-id', 'family-id', 'status', 'system']:
-        elem.attrib.pop(attr, None)
-
-    # Convert what's left in the root element to a dictionary
-    extra_data = xml_to_dict(elem)
-    if extra_data is None:
-        extra_data = {}
-    elif isinstance(extra_data, str):
-        extra_data = {"#text": extra_data}
+    
+    # CRITICAL: Capture full tree BEFORE removing any blocks to ensure no nested data is lost.
+    # This preserves all unhandled fields at any nesting level.
+    full_tree = xml_to_dict(elem)
+    
+    # Known blocks that have unpredictable structure (like abstract, title, citations)
+    # or deeply nested but fully mapped arrays where we want to drop the whole block.
+    # We do NOT put purely structural wrappers like 'parties' or 'bibliographic-data' here,
+    # nor do we put 'publication-reference', so they can naturally host unknown custom tags.
+    fully_handled_keys = {
+        "applicants",
+        "inventors",
+        "designation-epc",
+        "designation-pct",
+        "patent-classifications",
+        "classifications-ipcr",
+        "references-cited",
+        "dates-of-public-availability",
+        "abstract",
+        "invention-title",
+        "language-of-publication"
+    }
+    
+    # Context-aware pruning: Only remove these generic leaf tags when they appear 
+    # directly inside their standard EPO parent containers.
+    # This safely collapses fully-mapped blocks (like empty priority-claims) while
+    # preserving these exact same tags if they appear inside an unknown <doc-fake> block.
+    context_handled_keys = {
+        "document-id": {"country", "doc-number", "kind", "date", "name", "lang", "doc-id"},
+        "publication-reference": {"data-format", "sequence"},
+        "application-reference": {"data-format", "sequence", "is-representative", "doc-id"},
+        "priority-claim": {"data-format", "sequence", "priority-active-indicator"},
+        "applicant": {"sequence", "data-format"},
+        "applicant-name": {"name"},
+        "inventor": {"sequence", "data-format"},
+        "inventor-name": {"name"},
+        "classification-ipcr": {"sequence"}
+    }
+    
+    # Known root-level attributes that were extracted into proper columns
+    known_attributes = {
+        'country', 'doc-number', 'kind', 'date-publ', 'doc-id', 
+        'family-id', 'status', 'system',
+        'is-representative',       # extracted directly from root elem to is_representative column
+        'originating-office',      # promoted to originating_office column
+        'date-added-docdb',        # promoted to date_added_docdb column
+        'date-of-last-exchange',   # promoted to date_last_exchange column
+    }
+    
+    # Build extra_data by recursively removing known keys from the full tree
+    app_extra_data = {}
+    pub_extra_data = {}
+    if full_tree and isinstance(full_tree, dict):
+        # First remove known root attributes to prevent bloat at the top level
+        root_cleaned = {k: v for k, v in full_tree.items() if k not in known_attributes}
         
-    pub_master.extra_data = extra_data
+        # Then recursively prune deeply nested handled arrays/blocks
+        pruned = prune_dict(root_cleaned, fully_handled_keys, context_handled_keys)
+        
+        if pruned and isinstance(pruned, dict):
+            # Partition application-level extra data
+            biblio = pruned.get("bibliographic-data", {})
+            if isinstance(biblio, dict) and "application-reference" in biblio:
+                app_refs = biblio.pop("application-reference")
+                app_extra_data = {"bibliographic-data": {"application-reference": app_refs}}
+                
+                # Clean up empty bibliographic-data wrapper in pub_master
+                if not biblio:
+                    pruned.pop("bibliographic-data")
+                    
+            pub_extra_data = pruned
+    
+    # Log any unhandled data for debugging
+    if pub_extra_data or app_extra_data:
+        unhandled = list(pub_extra_data.keys()) + list(app_extra_data.keys())
+        logger.info(f"Document {pub_doc_id} has unhandled fields: {unhandled}")
+        logger.debug(f"Unhandled pub data: {pub_extra_data} | Unhandled app data: {app_extra_data}")
+    
+    app_master.extra_data = app_extra_data if app_extra_data else {}
+    pub_master.extra_data = pub_extra_data if pub_extra_data else {}
 
     return ExchangeDocument(
         app_master=app_master,
         pub_master=pub_master,
+        operation=status,  # 'C'=Create/Amend (upsert) | 'D'/'DV'/'V'=Delete
         priorities=priorities,
         parties=parties,
         designations=designations,

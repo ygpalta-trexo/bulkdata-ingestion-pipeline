@@ -9,6 +9,8 @@ from docdb_ingestion.database import DatabaseManager
 from docdb_ingestion.models import ExchangeDocument
 from dotenv import load_dotenv
 
+from docdb_ingestion.database import DatabaseManager, get_dsn_from_env
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,7 @@ def main():
     parser.add_argument("--index", required=True, help="Path to index.xml")
     parser.add_argument("--dsn", help="Postgres DSN (optional if using .env)")
     parser.add_argument("--limit", type=int, help="Limit number of ZIP files to process (for testing)")
+    parser.add_argument("--start-index", type=int, default=1, help="1-based index to start processing from (to distribute workload)")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument("--dry-run", action="store_true", help="Process files but do not write to DB")
     parser.add_argument("--force", action="store_true", help="Re-process files even if completed")
@@ -31,22 +34,22 @@ def main():
     logger.info(f"Found {len(package_files)} files in index.")
 
 
+    # Apply start-index (1-based index)
+    if args.start_index > 1:
+        skip_count = args.start_index - 1
+        if skip_count >= len(package_files):
+            logger.warning(f"--start-index {args.start_index} is greater than total files ({len(package_files)}). Nothing to process.")
+            return
+        package_files = package_files[skip_count:]
+        logger.info(f"Skipped first {skip_count} files. Starting at index {args.start_index} out of total files.")
+
     if args.limit:
         package_files = package_files[:args.limit]
         logger.info(f"Limiting to first {args.limit} files.")
 
     db = None
     if not args.dry_run:
-        dsn = args.dsn
-        if not dsn:
-             # Try fallback to env
-             user = os.getenv("POSTGRES_USER", "postgres")
-             password = os.getenv("POSTGRES_PASSWORD", "password")
-             host = os.getenv("POSTGRES_HOST", "localhost")
-             port = os.getenv("POSTGRES_PORT", "5432")
-             dbname = os.getenv("POSTGRES_DB", "docdb")
-             dsn_env = os.getenv("DATABASE_URL")
-             dsn = dsn_env or f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        dsn = args.dsn or get_dsn_from_env()
         
         db = DatabaseManager(dsn)
         db.connect()

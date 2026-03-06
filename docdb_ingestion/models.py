@@ -21,7 +21,9 @@ class DocumentMaster(BaseModel):
     family_id: Optional[str] = None
     is_representative: Optional[bool] = None
     is_grant: bool = False
-    exchange_status: str
+    originating_office: Optional[str] = None
+    date_added_docdb: Optional[date] = None
+    date_last_exchange: Optional[date] = None
     extra_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 class PriorityClaim(BaseModel):
@@ -90,6 +92,9 @@ class AbstractOrTitle(BaseModel):
 class ExchangeDocument(BaseModel):
     app_master: ApplicationMaster
     pub_master: DocumentMaster
+    # 'C' = Create/Amend (upsert), 'D'/'DV'/'V' = Delete
+    # This controls routing in bulk_upsert_safe — it is NOT stored in the database.
+    operation: str = 'C'
     priorities: List[PriorityClaim] = Field(default_factory=list)
     parties: List[Party] = Field(default_factory=list)
     designations: List[DesignationOfState] = Field(default_factory=list)
