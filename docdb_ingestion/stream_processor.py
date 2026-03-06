@@ -54,7 +54,9 @@ def xml_to_dict(node: Optional[ET.Element], max_depth: int = 50, _current_depth:
     
     result = {}
     if node.attrib:
-        result.update({k: v for k, v in node.attrib.items()})
+        for k, v in node.attrib.items():
+            clean_k = k.split('}')[-1] if '}' in k else k
+            result[clean_k] = v
     
     for child in node:
         # Handle potential lxml element corruption
@@ -218,6 +220,7 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     # Extract Application Master (Root)
     # NOTE: child tags like <document-id>, <country>, <doc-number>, <kind>, <date>
     # inside <application-reference> have NO namespace prefix in the DOCDB XML.
+    app_master = None
     for app_node in elem.findall(".//exch:application-reference", namespaces=NS):
         format_type = app_node.get('data-format', '')
         if format_type == 'docdb':
@@ -495,7 +498,9 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
         "dates-of-public-availability",
         "abstract",
         "invention-title",
-        "language-of-publication"
+        "language-of-publication",
+        "classification-ipc",
+        "classification-national"
     }
     
     # Context-aware pruning: Only remove these generic leaf tags when they appear 
@@ -506,7 +511,7 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
         "document-id": {"country", "doc-number", "kind", "date", "name", "lang", "doc-id"},
         "publication-reference": {"data-format", "sequence"},
         "application-reference": {"data-format", "sequence", "is-representative", "doc-id"},
-        "priority-claim": {"data-format", "sequence", "priority-active-indicator"},
+        "priority-claim": {"data-format", "sequence", "priority-active-indicator", "priority-linkage-type"},
         "applicant": {"sequence", "data-format"},
         "applicant-name": {"name"},
         "inventor": {"sequence", "data-format"},

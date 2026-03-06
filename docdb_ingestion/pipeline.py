@@ -5,7 +5,7 @@ import shutil
 import glob
 from dotenv import load_dotenv
 
-from .database import DatabaseManager
+from .database import DatabaseManager, get_dsn_from_env
 from .epo_api import get_delivery_files, download_file
 from .stream_processor import process_zip_file
 
@@ -13,16 +13,7 @@ logger = logging.getLogger(__name__)
 
 class PipelineOrchestrator:
     def __init__(self):
-        load_dotenv()
-        
-        self.dsn = os.environ.get("DATABASE_URL")
-        if not self.dsn:
-            user = os.environ.get("POSTGRES_USER", "postgres")
-            password = os.environ.get("POSTGRES_PASSWORD", "postgres")
-            host = os.environ.get("POSTGRES_HOST", "localhost")
-            port = os.environ.get("POSTGRES_PORT", "5432")
-            db = os.environ.get("POSTGRES_DB", "bulk-data")
-            self.dsn = f"postgresql://{user}:{password}@{host}:{port}/{db}"
+        self.dsn = get_dsn_from_env()
             
         self.product_id = int(os.environ.get("EPO_PRODUCT_ID", 14))
         self.delivery_id = int(os.environ.get("EPO_DELIVERY_ID", 3071))

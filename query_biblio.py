@@ -13,9 +13,7 @@ import re
 import os
 import json
 import argparse
-import psycopg
-from psycopg.rows import dict_row
-from dotenv import load_dotenv
+from docdb_ingestion.database import DatabaseManager, get_dsn_from_env
 
 
 # ---------------------------------------------------------------------------
@@ -49,19 +47,6 @@ def split_patent_number(raw: str):
         number = rest
 
     return country, number, kind or None
-
-
-def get_dsn():
-    load_dotenv()
-    dsn = os.getenv("DATABASE_URL")
-    if dsn:
-        return dsn
-    user     = os.getenv("POSTGRES_USER",     "postgres")
-    password = os.getenv("POSTGRES_PASSWORD", "password")
-    host     = os.getenv("POSTGRES_HOST",     "localhost")
-    port     = os.getenv("POSTGRES_PORT",     "5432")
-    dbname   = os.getenv("POSTGRES_DB",       "bulk-data")
-    return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
 
 
 # ---------------------------------------------------------------------------

@@ -161,6 +161,7 @@ Examples:
         logging.getLogger().setLevel(logging.DEBUG)
 
     try:
+        db = None
         # Find ZIP files
         zip_files = find_zip_files(args.folder)
 
@@ -183,7 +184,6 @@ Examples:
             logger.info(f"Limited processing to {args.limit} files")
 
         # Setup database connection if not dry run
-        db = None
         if not args.dry_run:
             dsn = args.dsn or get_dsn_from_env()
 
