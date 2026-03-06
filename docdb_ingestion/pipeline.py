@@ -39,30 +39,38 @@ class PipelineOrchestrator:
         self.db.sync_delivery_files(self.product_id, self.delivery_id, files)
         logger.info(f"Successfully synchronized {len(files)} files to the database.")
 
-    def run(self, start_index=1):
+    def run(self, start_index=1, limit=None):
         """Main execution loop for downloading, extracting, and processing files."""
         logger.info("Starting pipeline execution loop...")
         
-        actionable_files = self.db.get_actionable_files(self.product_id, self.delivery_id)
-        if not actionable_files:
-            logger.info("No actionable files found. Pipeline is idle.")
+        all_files = self.db.get_all_delivery_files(self.product_id, self.delivery_id)
+        if not all_files:
+            logger.info("No delivery files found. Pipeline is idle.")
             return
             
         # Apply start-index (1-based index)
         if start_index > 1:
             skip_count = start_index - 1
-            if skip_count >= len(actionable_files):
-                logger.warning(f"start_index {start_index} is greater than total actionable files ({len(actionable_files)}). Nothing to process.")
+            if skip_count >= len(all_files):
+                logger.warning(f"start_index {start_index} is greater than total delivery files ({len(all_files)}). Nothing to process.")
                 return
-            actionable_files = actionable_files[skip_count:]
+            all_files = all_files[skip_count:]
             logger.info(f"Skipped first {skip_count} files. Starting at index {start_index} out of total files.")
             
-        logger.info(f"Found {len(actionable_files)} files to process.")
+        if limit is not None:
+            all_files = all_files[:limit]
+            logger.info(f"Applying limit: processing {len(all_files)} files.")
+            
+        logger.info(f"Found {len(all_files)} files to process.")
         
-        for file_rec in actionable_files:
+        for file_rec in all_files:
             file_id = file_rec['file_id']
             filename = file_rec['filename']
             status = file_rec['status']
+            
+            if status in ('COMPLETED', 'FAILED'):
+                logger.info(f"Skipping already '{status}' file ID {file_id}: {filename}")
+                continue
             
             # Paths
             dest_zip_path = os.path.join(self.temp_dir, filename)
@@ -193,6 +201,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run the EPO Pipeline Orchestrator")
     parser.add_argument("command", choices=["sync", "run"], help="Command to execute")
     parser.add_argument("--start-index", type=int, default=1, help="1-based index to point pipeline at the Nth actionable file")
+    parser.add_argument("--limit", type=int, help="Limit the number of actionable files to process")
     
     args = parser.parse_args()
         
@@ -204,7 +213,7 @@ def main():
     if cmd == 'sync':
         orchestrator.sync()
     elif cmd == 'run':
-        orchestrator.run(start_index=args.start_index)
+        orchestrator.run(start_index=args.start_index, limit=args.limit)
     else:
         logger.error(f"Unknown command: {cmd}")
 

@@ -289,6 +289,16 @@ class DatabaseManager:
             """, (product_id, delivery_id))
             return [dict(row) for row in cur.fetchall()]
             
+    def get_all_delivery_files(self, product_id: int, delivery_id: int) -> List[dict]:
+        """Fetch all files for a delivery, regardless of status."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM delivery_files 
+                WHERE product_id = %s AND delivery_id = %s 
+                ORDER BY file_id ASC;
+            """, (product_id, delivery_id))
+            return [dict(row) for row in cur.fetchall()]
+            
     def update_file_status(self, file_id: int, status: str, error_message: str = None):
         """Transition file state, useful for the pipeline state machine."""
         with self.conn.cursor() as cur:

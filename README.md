@@ -71,6 +71,13 @@ python -m docdb_ingestion.pipeline sync
 python -m docdb_ingestion.pipeline run
 ```
 
+**Advanced Pipeline Controls:**
+You can split the workload across multiple terminal sessions or test small batches by using the absolute slicing arguments:
+```bash
+# Skip the first 10 delivery files and process exactly the next 5 files before exiting cleanly
+python -m docdb_ingestion.pipeline run --start-index 11 --limit 5
+```
+
 All process output will be saved both to STANDARD OUT and into daily rolling logs located in `logs/<YYYY-MM-DD>/pipeline.log`.
 
 ## Data Schema Summary
