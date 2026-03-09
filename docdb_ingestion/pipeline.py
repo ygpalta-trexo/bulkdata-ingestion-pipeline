@@ -39,7 +39,7 @@ class PipelineOrchestrator:
         self.db.sync_delivery_files(self.product_id, self.delivery_id, files)
         logger.info(f"Successfully synchronized {len(files)} files to the database.")
 
-    def run(self, start_index=1, limit=None):
+    def run(self, start_index=1, limit=None, retry_failed=False):
         """Main execution loop for downloading, extracting, and processing files."""
         logger.info("Starting pipeline execution loop...")
         
@@ -68,9 +68,14 @@ class PipelineOrchestrator:
             filename = file_rec['filename']
             status = file_rec['status']
             
-            if status in ('COMPLETED', 'FAILED'):
+            skip_statuses = ('COMPLETED',) if retry_failed else ('COMPLETED', 'FAILED')
+            if status in skip_statuses:
                 logger.info(f"Skipping already '{status}' file ID {file_id}: {filename}")
                 continue
+                
+            if status == 'FAILED' and retry_failed:
+                logger.info(f"Retrying 'FAILED' file ID {file_id}: {filename}")
+                status = 'PENDING'
             
             # Paths
             dest_zip_path = os.path.join(self.temp_dir, filename)
@@ -202,6 +207,7 @@ def main():
     parser.add_argument("command", choices=["sync", "run"], help="Command to execute")
     parser.add_argument("--start-index", type=int, default=1, help="1-based index to point pipeline at the Nth actionable file")
     parser.add_argument("--limit", type=int, help="Limit the number of actionable files to process")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry processing for files with 'FAILED' status")
     
     args = parser.parse_args()
         
@@ -213,7 +219,7 @@ def main():
     if cmd == 'sync':
         orchestrator.sync()
     elif cmd == 'run':
-        orchestrator.run(start_index=args.start_index, limit=args.limit)
+        orchestrator.run(start_index=args.start_index, limit=args.limit, retry_failed=args.retry_failed)
     else:
         logger.error(f"Unknown command: {cmd}")
 
