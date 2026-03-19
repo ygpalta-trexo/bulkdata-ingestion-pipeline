@@ -123,7 +123,7 @@ class DatabaseManager:
                     id BIGSERIAL PRIMARY KEY,
                     pub_doc_id VARCHAR(50) REFERENCES document_master(pub_doc_id) ON DELETE CASCADE,
                     treaty_type VARCHAR(5),
-                    designation_type VARCHAR(20),
+                    designation_type VARCHAR(255),
                     region_code VARCHAR(2),
                     country_code VARCHAR(2)
                 );
