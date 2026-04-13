@@ -237,6 +237,12 @@ class DatabaseManager:
             # Ingestion recovery: find all STARTED (unfinished) files quickly
             cur.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_status ON ingestion_checkpoints (status);")
 
+            # Try to alter columns if upgrading existing schemas
+            try:
+                cur.execute("ALTER TABLE designation_of_states ALTER COLUMN designation_type TYPE VARCHAR(255);")
+            except psycopg.errors.UndefinedTable:
+                pass # First-time setup handles correctly
+                
             self.conn.commit()
 
     def is_file_processed(self, filename: str) -> bool:
