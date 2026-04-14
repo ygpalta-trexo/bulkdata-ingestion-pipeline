@@ -258,7 +258,7 @@ def main():
                 with rds_conn.cursor() as rcur:
                     rcur.execute("SELECT MAX(citation_id) FROM rich_citations_network;")
                     cit_max = rcur.fetchone()['max'] or 0
-                state['citation_offset'] = ((cit_max // 100000000) + 1) * 100000000
+                state['citation_offset'] = ((cit_max // 1000000000) + 1) * 1000000000
                 save_checkpoint(state)
             offset = state['citation_offset']
             
