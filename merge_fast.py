@@ -217,6 +217,10 @@ def main():
         cursor.execute("ALTER TABLE public_availability_dates DROP CONSTRAINT IF EXISTS public_availability_dates_pub_doc_id_fkey CASCADE;")
         cursor.execute("ALTER TABLE rich_citations_network DROP CONSTRAINT IF EXISTS rich_citations_network_pub_doc_id_fkey CASCADE;")
         cursor.execute("ALTER TABLE citation_passage_mapping DROP CONSTRAINT IF EXISTS citation_passage_mapping_citation_id_fkey CASCADE;")
+        # Drop PKs on citation tables to prevent collisions across developers and reruns
+        cursor.execute("ALTER TABLE rich_citations_network DROP CONSTRAINT IF EXISTS rich_citations_network_pkey CASCADE;")
+        cursor.execute("ALTER TABLE citation_passage_mapping DROP CONSTRAINT IF EXISTS citation_passage_mapping_pkey CASCADE;")
+    
     rds_conn.commit()
     
     try:
