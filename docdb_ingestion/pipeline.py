@@ -3,6 +3,7 @@ import logging
 import zipfile
 import shutil
 import glob
+from datetime import datetime
 from dotenv import load_dotenv
 
 from .database import DatabaseManager, get_dsn_from_env
@@ -10,6 +11,21 @@ from .epo_api import get_delivery_files, download_file
 from .stream_processor import process_zip_file
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_pipeline_log_file(worker_name: str = None, explicit_log_file: str = None) -> str:
+    """Resolve the log file path for a pipeline worker."""
+    if explicit_log_file:
+        log_file = explicit_log_file
+    else:
+        date_dir = os.path.join(os.getcwd(), 'logs', datetime.now().strftime('%Y-%m-%d'))
+        os.makedirs(date_dir, exist_ok=True)
+        base_name = 'pipeline.log' if not worker_name else f'pipeline_{worker_name}.log'
+        log_file = os.path.join(date_dir, base_name)
+
+    log_dir = os.path.dirname(os.path.abspath(log_file))
+    os.makedirs(log_dir, exist_ok=True)
+    return log_file
 
 class PipelineOrchestrator:
     def __init__(self):
@@ -195,13 +211,23 @@ class PipelineOrchestrator:
                     
 def main():
     import sys
-    from datetime import datetime
     import argparse
     
-    # Setup Date-wise logging
-    log_dir = os.path.join(os.getcwd(), 'logs', datetime.now().strftime('%Y-%m-%d'))
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, 'pipeline.log')
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Run the EPO Pipeline Orchestrator")
+    parser.add_argument("command", choices=["sync", "run"], help="Command to execute")
+    parser.add_argument("--start-index", type=int, default=1, help="1-based index to point pipeline at the Nth actionable file")
+    parser.add_argument("--limit", type=int, help="Limit the number of actionable files to process")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry processing for files with 'FAILED' status")
+    parser.add_argument("--log-file", help="Explicit log file path for this worker/process")
+    parser.add_argument("--worker-name", help="Worker label used in the default log filename, e.g. worker1")
+    
+    args = parser.parse_args()
+
+    worker_name = args.worker_name or os.environ.get("PIPELINE_WORKER_NAME")
+    explicit_log_file = args.log_file or os.environ.get("PIPELINE_LOG_FILE")
+    log_file = resolve_pipeline_log_file(worker_name=worker_name, explicit_log_file=explicit_log_file)
     
     logging.basicConfig(
         level=logging.INFO,
@@ -209,17 +235,12 @@ def main():
         handlers=[
             logging.FileHandler(log_file),
             logging.StreamHandler(sys.stdout)
-        ]
+        ],
+        force=True,
     )
     logger.info(f"Logging initialized. Outputting to {log_file}")
-    
-    parser = argparse.ArgumentParser(description="Run the EPO Pipeline Orchestrator")
-    parser.add_argument("command", choices=["sync", "run"], help="Command to execute")
-    parser.add_argument("--start-index", type=int, default=1, help="1-based index to point pipeline at the Nth actionable file")
-    parser.add_argument("--limit", type=int, help="Limit the number of actionable files to process")
-    parser.add_argument("--retry-failed", action="store_true", help="Retry processing for files with 'FAILED' status")
-    
-    args = parser.parse_args()
+    if worker_name:
+        logger.info(f"Worker name: {worker_name}")
         
     cmd = args.command
     logger.info(f"Initialized Pipeline Orchestrator for command: {cmd}")
