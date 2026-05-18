@@ -11,32 +11,23 @@ from query_biblio import fetch_full_biblio
 
 def fetch_top_pubs(db, limit: int = 100) -> List[Dict]:
     """Fetch the first X publications and their full bibliographic data."""
-    # Query for the documents that have the most comprehensive data associated with them
-    # Query for documents that have at least 3 out of the 4 key data enrichments
     with db.conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT m.*
-            FROM document_master m
-            LEFT JOIN (
-                SELECT pub_doc_id, 1 as has_inv 
-                FROM parties WHERE party_type = 'INVENTOR' GROUP BY pub_doc_id
-            ) as inv ON m.pub_doc_id = inv.pub_doc_id
-            LEFT JOIN (
-                SELECT pub_doc_id, 1 as has_cls 
-                FROM patent_classifications GROUP BY pub_doc_id
-            ) as cls ON m.pub_doc_id = cls.pub_doc_id
-            LEFT JOIN (
-                SELECT pub_doc_id, 1 as has_pri 
-                FROM priority_claims GROUP BY pub_doc_id
-            ) as pri ON m.pub_doc_id = pri.pub_doc_id
-            LEFT JOIN (
-                SELECT pub_doc_id, 1 as has_cit 
-                FROM rich_citations_network GROUP BY pub_doc_id
-            ) as cit ON m.pub_doc_id = cit.pub_doc_id
-            WHERE (COALESCE(inv.has_inv, 0) + COALESCE(cls.has_cls, 0) + COALESCE(pri.has_pri, 0) + COALESCE(cit.has_cit, 0)) >= 3
-            ORDER BY m.country ASC, m.doc_number ASC, m.kind_code ASC
-            LIMIT {limit}
-        """)
+        cur.execute(
+            """
+            SELECT *
+            FROM patent_documents
+            WHERE
+                jsonb_array_length(COALESCE(parties->'inventors', '[]'::jsonb)) > 0
+                AND (
+                    (CASE WHEN jsonb_array_length(classifications) > 0 THEN 1 ELSE 0 END) +
+                    (CASE WHEN jsonb_array_length(priorities) > 0 THEN 1 ELSE 0 END) +
+                    (CASE WHEN jsonb_array_length(citations) > 0 THEN 1 ELSE 0 END)
+                ) >= 2
+            ORDER BY country ASC, doc_number ASC, kind_code ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
         pubs = cur.fetchall()
         
         results = []
@@ -94,7 +85,7 @@ def flatten_for_excel(data: List[Dict]) -> Dict[str, pd.DataFrame]:
         # Quick summary fields for the main sheet
         def _fmt_party(p):
             res = p.get('residence')
-            return f"{p['party_name']} [{res}]" if res else p['party_name']
+            return f"{p['name']} [{res}]" if res else p['name']
             
         applicants_summary = " | ".join([_fmt_party(a) for a in item.get("applicants", [])])
         inventors_summary = " | ".join([_fmt_party(i) for i in item.get("inventors", [])])
@@ -121,7 +112,7 @@ def flatten_for_excel(data: List[Dict]) -> Dict[str, pd.DataFrame]:
                 "Publication Number": pub_num_display,
                 "Role": "APPLICANT",
                 "Sequence": a.get("sequence"),
-                "Name": a.get("party_name"),
+                "Name": a.get("name"),
                 "Country": a.get("residence")
             })
         for i in item.get("inventors", []):
@@ -130,7 +121,7 @@ def flatten_for_excel(data: List[Dict]) -> Dict[str, pd.DataFrame]:
                 "Publication Number": pub_num_display,
                 "Role": "INVENTOR",
                 "Sequence": i.get("sequence"),
-                "Name": i.get("party_name"),
+                "Name": i.get("name"),
                 "Country": i.get("residence")
             })
             

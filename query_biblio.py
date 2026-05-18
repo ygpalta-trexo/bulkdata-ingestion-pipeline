@@ -3,180 +3,133 @@
 query_biblio.py – Look up full bibliographic data for a patent document.
 
 Usage:
-    python3 docdb_ingestion/query_biblio.py AP2355A
-    python3 docdb_ingestion/query_biblio.py US34567 A1
-    python3 docdb_ingestion/query_biblio.py --country AP --number 2355 --kind A
+    python3 query_biblio.py AP2355A
+    python3 query_biblio.py US34567A1
+    python3 query_biblio.py --country AP --number-only 2355 --kind A
 """
 
-import sys
-import re
-import os
-import json
 import argparse
-from docdb_ingestion.database import DatabaseManager, get_dsn_from_env
+import json
+import re
+import sys
+
+import psycopg
+from psycopg.rows import dict_row
+
+from docdb_ingestion.database import get_dsn_from_env
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing & number splitting
-# ---------------------------------------------------------------------------
+COUNTRY_CODES = re.compile(r"^([A-Z]{2})")
+KIND_CODES = re.compile(r"([A-Z][0-9]?[A-Z]?)$")
 
-COUNTRY_CODES = re.compile(r'^([A-Z]{2,3})')
-KIND_CODES = re.compile(r'([A-Z][0-9]?[A-Z]?)$')
 
 def split_patent_number(raw: str):
-    """
-    Split a freeform patent number like 'US12345678B2' or 'AP2355A'
-    into (country, number, kind).  Kind is optional.
-    """
     raw = raw.strip().upper()
-
-    # Match 2-character country prefix
     cm = COUNTRY_CODES.match(raw)
     if not cm:
         return None, raw, None
+
     country = cm.group(1)
     rest = raw[len(country):]
-
-    # Try to match a trailing kind code (1-3 chars, starts with letter)
     km = KIND_CODES.search(rest)
     if km:
-        kind = km.group(1)
-        number = rest[:km.start()]
-    else:
-        kind = None
-        number = rest
+        return country, rest[:km.start()], km.group(1)
+    return country, rest, None
 
-    return country, number, kind or None
-
-
-# ---------------------------------------------------------------------------
-# Database queries
-# ---------------------------------------------------------------------------
 
 def find_publications(cur, country, number, kind):
-    """Return matching document_master rows."""
     if kind:
-        cur.execute("""
-            SELECT * FROM document_master
+        cur.execute(
+            """
+            SELECT *
+            FROM patent_documents
             WHERE country = %s AND doc_number = %s AND kind_code = %s
-        """, (country, number, kind))
+            ORDER BY date_publ, pub_doc_id;
+            """,
+            (country, number, kind),
+        )
     else:
-        cur.execute("""
-            SELECT * FROM document_master
+        cur.execute(
+            """
+            SELECT *
+            FROM patent_documents
             WHERE country = %s AND doc_number = %s
-            ORDER BY date_publ
-        """, (country, number))
+            ORDER BY date_publ, pub_doc_id;
+            """,
+            (country, number),
+        )
     return cur.fetchall()
 
 
 def fetch_full_biblio(cur, pub):
-    pub_doc_id = pub["pub_doc_id"]
-    app_doc_id = pub["app_doc_id"]
+    parties = pub.get("parties") or {}
+    texts = pub.get("texts") or []
 
-    INTERNAL_FIELDS = {'created_at', 'updated_at', 'format_type', 'party_type'}
+    priority_claims = []
+    for priority in pub.get("priorities") or []:
+        normalized_priority = dict(priority)
+        if "priority_date" not in normalized_priority:
+            normalized_priority["priority_date"] = normalized_priority.get("date")
+        priority_claims.append(normalized_priority)
 
-    def clean(row: dict, exclude: set = None) -> dict:
-        skip = INTERNAL_FIELDS | (exclude or set())
-        return {k: v for k, v in row.items() if k not in skip}
+    result = {
+        "application": {
+            "app_doc_id": pub.get("app_doc_id"),
+            "app_country": pub.get("app_country"),
+            "app_number": pub.get("app_number"),
+            "app_kind_code": pub.get("app_kind_code"),
+            "app_date": pub.get("app_date"),
+            "extra_data": pub.get("app_extra_data") or {},
+        },
+        "publication": {
+            "pub_doc_id": pub.get("pub_doc_id"),
+            "country": pub.get("country"),
+            "doc_number": pub.get("doc_number"),
+            "kind_code": pub.get("kind_code"),
+            "extended_kind": pub.get("extended_kind"),
+            "date_publ": pub.get("date_publ"),
+            "family_id": pub.get("family_id"),
+            "is_representative": pub.get("is_representative"),
+            "is_grant": pub.get("is_grant"),
+            "originating_office": pub.get("originating_office"),
+            "date_added_docdb": pub.get("date_added_docdb"),
+            "date_last_exchange": pub.get("date_last_exchange"),
+            "extra_data": pub.get("pub_extra_data") or {},
+        },
+        "applicants": parties.get("applicants") or [],
+        "inventors": parties.get("inventors") or [],
+        "other_parties": parties.get("others") or [],
+        "priority_claims": priority_claims,
+        "classifications": pub.get("classifications") or [],
+        "citations": pub.get("citations") or [],
+        "availability_dates": pub.get("availability_dates") or [],
+        "titles": [item for item in texts if item.get("text_type") == "TITLE"],
+        "abstracts": [item for item in texts if item.get("text_type") == "ABSTRACT"],
+    }
 
-    result = {}
-
-    # --- Application ---
-    cur.execute("SELECT * FROM application_master WHERE app_doc_id = %s", (app_doc_id,))
-    app = cur.fetchone()
-    result["application"] = clean(dict(app)) if app else {}
-
-    # --- Publication ---
-    result["publication"] = clean(dict(pub), exclude={'app_doc_id', 'exchange_status', 'is_representative'})
-
-    # --- Parties ---
-    cur.execute("""
-        SELECT party_type, sequence, party_name, residence, address_text
-        FROM parties WHERE pub_doc_id = %s
-        ORDER BY party_type, sequence
-    """, (pub_doc_id,))
-    parties = cur.fetchall()
-    result["applicants"] = [clean(dict(p)) for p in parties if p["party_type"] == "APPLICANT"]
-    result["inventors"]  = [clean(dict(p)) for p in parties if p["party_type"] == "INVENTOR"]
-
-    # --- Priority Claims ---
-    cur.execute("""
-        SELECT format_type, sequence, priority_doc_id, country, doc_number, date AS priority_date, linkage_type, is_active
-        FROM priority_claims WHERE pub_doc_id = %s
-        ORDER BY sequence
-    """, (pub_doc_id,))
-    result["priority_claims"] = [dict(r) for r in cur.fetchall()]
-
-    # --- Abstracts & Titles ---
-    cur.execute("""
-        SELECT text_type, lang, format_type, source, content
-        FROM abstracts_and_titles WHERE pub_doc_id = %s
-        ORDER BY text_type, lang
-    """, (pub_doc_id,))
-    texts = cur.fetchall()
-    result["titles"]    = [dict(t) for t in texts if t["text_type"] == "TITLE"]
-    result["abstracts"] = [dict(t) for t in texts if t["text_type"] == "ABSTRACT"]
-
-    # --- Classifications ---
-    cur.execute("""
-        SELECT scheme_name, sequence, symbol, class_value, symbol_pos, generating_office
-        FROM patent_classifications WHERE pub_doc_id = %s
-        ORDER BY scheme_name, sequence
-    """, (pub_doc_id,))
-    result["classifications"] = [dict(r) for r in cur.fetchall()]
-
-    # --- Citations ---
-    cur.execute("""
-        SELECT citation_id, cited_phase, sequence, citation_type, cited_doc_id, dnum_type,
-               npl_type, extracted_xp, citation_text
-        FROM rich_citations_network WHERE pub_doc_id = %s
-        ORDER BY sequence
-    """, (pub_doc_id,))
-    citations = cur.fetchall()
-    cit_list = []
-    for cit in citations:
-        c = dict(cit)
-        cur.execute("""
-            SELECT category, rel_claims, passage_text
-            FROM citation_passage_mapping WHERE citation_id = %s
-        """, (cit["citation_id"],))
-        c["passages"] = [dict(p) for p in cur.fetchall()]
-        cit_list.append(c)
-    result["citations"] = cit_list
-
-    # --- Public Availability Dates ---
-    cur.execute("""
-        SELECT availability_type, availability_date
-        FROM public_availability_dates WHERE pub_doc_id = %s
-        ORDER BY availability_date
-    """, (pub_doc_id,))
-    result["availability_dates"] = [dict(r) for r in cur.fetchall()]
-
-    # --- Sibling publications (same application) ---
-    cur.execute("""
-        SELECT pub_doc_id, country, doc_number, kind_code, date_publ, is_grant
-        FROM document_master WHERE app_doc_id = %s AND pub_doc_id != %s
-        ORDER BY date_publ
-    """, (app_doc_id, pub_doc_id))
-    result["related_publications"] = [dict(r) for r in cur.fetchall()]
-
+    cur.execute(
+        """
+        SELECT country, pub_doc_id, doc_number, kind_code, date_publ, is_grant
+        FROM patent_documents
+        WHERE app_doc_id = %s AND pub_doc_id != %s
+        ORDER BY date_publ, pub_doc_id;
+        """,
+        (pub.get("app_doc_id"), pub.get("pub_doc_id")),
+    )
+    result["related_publications"] = [dict(row) for row in cur.fetchall()]
     return result
 
-
-# ---------------------------------------------------------------------------
-# Pretty printer
-# ---------------------------------------------------------------------------
 
 def pretty_print(data: dict, pub_number: str):
     def d(val):
         return str(val) if val is not None else "—"
 
-    pub  = data.get("publication", {})
-    app  = data.get("application", {})
+    pub = data.get("publication", {})
+    app = data.get("application", {})
 
-    print("\n" + "═"*60)
+    print("\n" + "═" * 60)
     print(f"  BIBLIOGRAPHIC DATA  ·  {pub_number.upper()}")
-    print("═"*60)
+    print("═" * 60)
 
     print("\n── APPLICATION ─────────────────────────────────────────────")
     print(f"  App Doc ID  : {d(app.get('app_doc_id'))}")
@@ -196,100 +149,106 @@ def pretty_print(data: dict, pub_number: str):
 
     if data.get("titles"):
         print("\n── TITLES ──────────────────────────────────────────────────")
-        for t in data["titles"]:
-            print(f"  [{t.get('lang','?').upper()}] {t.get('content','')}")
+        for title in data["titles"]:
+            print(f"  [{title.get('lang', '?').upper()}] {title.get('content', '')}")
 
     if data.get("abstracts"):
         print("\n── ABSTRACTS ───────────────────────────────────────────────")
-        for a in data["abstracts"]:
-            print(f"  [{a.get('lang','?').upper()}] {a.get('content','')[:400]}{'…' if len(a.get('content',''))>400 else ''}")
+        for abstract in data["abstracts"]:
+            content = abstract.get("content", "")
+            suffix = "…" if len(content) > 400 else ""
+            print(f"  [{abstract.get('lang', '?').upper()}] {content[:400]}{suffix}")
 
     if data.get("applicants"):
         print("\n── APPLICANTS ──────────────────────────────────────────────")
-        for p in data["applicants"]:
-            print(f"  {p.get('sequence','?')}. {p.get('party_name','')}  [{d(p.get('residence'))}]  ({p.get('format_type','')})")
+        for party in data["applicants"]:
+            print(
+                f"  {party.get('sequence', '?')}. {party.get('name', '')}  "
+                f"[{d(party.get('residence'))}]  ({party.get('format', '')})"
+            )
 
     if data.get("inventors"):
         print("\n── INVENTORS ───────────────────────────────────────────────")
-        for p in data["inventors"]:
-            print(f"  {p.get('sequence','?')}. {p.get('party_name','')}  [{d(p.get('residence'))}]")
+        for party in data["inventors"]:
+            print(f"  {party.get('sequence', '?')}. {party.get('name', '')}  [{d(party.get('residence'))}]")
 
     if data.get("priority_claims"):
         print("\n── PRIORITY CLAIMS ─────────────────────────────────────────")
         seen = set()
-        for pc in data["priority_claims"]:
-            key = (pc.get("country"), pc.get("doc_number"))
+        for priority in data["priority_claims"]:
+            key = (priority.get("country"), priority.get("doc_number"))
             if key in seen:
                 continue
             seen.add(key)
-            print(f"  {pc.get('country')} {pc.get('doc_number')}  date={d(pc.get('priority_date'))}  active={pc.get('is_active')}")
+            print(
+                f"  {priority.get('country')} {priority.get('doc_number')}  "
+                f"date={d(priority.get('priority_date'))}  active={priority.get('is_active')}"
+            )
 
     if data.get("classifications"):
         print("\n── CLASSIFICATIONS ─────────────────────────────────────────")
-        for cl in data["classifications"]:
-            print(f"  [{cl.get('scheme_name','')}] {cl.get('symbol','').strip()}  class={d(cl.get('class_value'))}  pos={d(cl.get('symbol_pos'))}")
+        for classification in data["classifications"]:
+            print(
+                f"  [{classification.get('scheme_name', '')}] {classification.get('symbol', '').strip()}  "
+                f"class={d(classification.get('class_value'))}  pos={d(classification.get('symbol_pos'))}"
+            )
 
     if data.get("citations"):
         print("\n── CITATIONS ───────────────────────────────────────────────")
-        for ct in data["citations"][:10]:   # cap at 10 for display
-            if ct.get("citation_type") == "PATENT":
-                print(f"  [{ct.get('cited_phase','')}] PATENT {d(ct.get('cited_doc_id'))}")
+        for citation in data["citations"][:10]:
+            if citation.get("citation_type") == "PATENT":
+                print(f"  [{citation.get('cited_phase', '')}] PATENT {d(citation.get('cited_doc_id'))}")
             else:
-                snippet = (ct.get("citation_text") or "")[:120]
-                print(f"  [{ct.get('cited_phase','')}] NPL  {snippet}")
+                snippet = (citation.get("citation_text") or "")[:120]
+                print(f"  [{citation.get('cited_phase', '')}] NPL  {snippet}")
 
     if data.get("availability_dates"):
         print("\n── PUBLIC AVAILABILITY DATES ───────────────────────────────")
-        for av in data["availability_dates"]:
-            print(f"  {av.get('availability_type')}  :  {d(av.get('availability_date'))}")
+        for availability in data["availability_dates"]:
+            print(f"  {availability.get('availability_type')}  :  {d(availability.get('availability_date'))}")
 
     if data.get("related_publications"):
         print("\n── RELATED PUBLICATIONS (same application) ─────────────────")
-        for rp in data["related_publications"]:
-            grant = " ✓ GRANT" if rp.get("is_grant") else ""
-            print(f"  {rp.get('country')}{rp.get('doc_number')}{rp.get('kind_code')}  date={d(rp.get('date_publ'))}{grant}")
+        for related in data["related_publications"]:
+            grant = " ✓ GRANT" if related.get("is_grant") else ""
+            print(
+                f"  {related.get('country')}{related.get('doc_number')}{related.get('kind_code')}  "
+                f"date={d(related.get('date_publ'))}{grant}"
+            )
 
-    print("\n" + "═"*60 + "\n")
+    print("\n" + "═" * 60 + "\n")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         description="Look up full bibliographic data from the DOCDB database."
     )
-    parser.add_argument("number", nargs="?",
-                        help="Patent number, e.g. US34567A1 or AP2355A")
+    parser.add_argument("number", nargs="?", help="Patent number, e.g. US34567A1 or AP2355A")
     parser.add_argument("--country", help="Country code (2 letters)")
-    parser.add_argument("--number-only", dest="number_only",
-                        help="Document number only")
-    parser.add_argument("--kind",   help="Kind code, e.g. A1, B2")
-    parser.add_argument("--json",   action="store_true",
-                        help="Output raw JSON instead of pretty print")
+    parser.add_argument("--number-only", dest="number_only", help="Document number only")
+    parser.add_argument("--kind", help="Kind code, e.g. A1, B2")
+    parser.add_argument("--json", action="store_true", help="Output raw JSON instead of pretty print")
     args = parser.parse_args()
 
-    # Resolve country/number/kind
     if args.number:
         country, number, kind = split_patent_number(args.number)
     elif args.country and args.number_only:
         country = args.country.upper()
-        number  = args.number_only
-        kind    = args.kind.upper() if args.kind else None
+        number = args.number_only
+        kind = args.kind.upper() if args.kind else None
     else:
         parser.print_help()
         sys.exit(1)
 
     if kind and args.kind:
-        kind = args.kind.upper()   # CLI flag overrides auto-parsed
+        kind = args.kind.upper()
 
     print(f"\nSearching for: country={country}  number={number}  kind={kind or 'any'}")
 
     try:
-        conn = psycopg.connect(get_dsn(), row_factory=dict_row)
-    except Exception as e:
-        print(f"\nERROR: Could not connect to database.\n{e}")
+        conn = psycopg.connect(get_dsn_from_env(), row_factory=dict_row)
+    except Exception as exc:
+        print(f"\nERROR: Could not connect to database.\n{exc}")
         sys.exit(1)
 
     with conn.cursor() as cur:
@@ -306,15 +265,17 @@ def main():
             biblio = fetch_full_biblio(cur, pub)
             all_results.append(biblio)
             if not args.json:
-                label = f"{pub['country']}{pub['doc_number']}{pub.get('kind_code','')}"
+                label = f"{pub['country']}{pub['doc_number']}{pub.get('kind_code', '')}"
                 pretty_print(biblio, label)
 
         if args.json:
             def serial(obj):
                 import datetime
+
                 if isinstance(obj, (datetime.date, datetime.datetime)):
                     return obj.isoformat()
                 raise TypeError(f"Type {type(obj)} not serializable")
+
             print(json.dumps(all_results, indent=2, default=serial))
 
     conn.close()

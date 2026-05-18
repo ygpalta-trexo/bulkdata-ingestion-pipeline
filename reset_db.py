@@ -7,21 +7,12 @@ def reset_database():
 
     with db.conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS application_master CASCADE;
-            DROP TABLE IF EXISTS document_master CASCADE;
-            DROP TABLE IF EXISTS application_reference CASCADE;
-            DROP TABLE IF EXISTS priority_claims CASCADE;
-            DROP TABLE IF EXISTS parties CASCADE;
-            DROP TABLE IF EXISTS designation_of_states CASCADE;
-            DROP TABLE IF EXISTS patent_classifications CASCADE;
-            DROP TABLE IF EXISTS rich_citations_network CASCADE;
-            DROP TABLE IF EXISTS citation_passage_mapping CASCADE;
-            DROP TABLE IF EXISTS public_availability_dates CASCADE;
-            DROP TABLE IF EXISTS abstracts_and_titles CASCADE;
+            DROP TABLE IF EXISTS patent_documents CASCADE;
             DROP TABLE IF EXISTS ingestion_checkpoints CASCADE;
+            DROP TABLE IF EXISTS delivery_files CASCADE;
         """)
         db.conn.commit()
-        print("Dropped old tables.")
+        print("Dropped single-table schema.")
 
     db.init_schema()
     print("Reinitialized fresh schema.")
