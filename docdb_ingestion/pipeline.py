@@ -154,7 +154,13 @@ class PipelineOrchestrator:
                         doc_generator = process_zip_file(inner_zip, dtd_dir)
                         
                         batch = []
+                        first_doc_number = None
+                        last_doc_number = None
                         for doc in doc_generator:
+                            current_doc_number = doc.pub_master.doc_number
+                            if first_doc_number is None:
+                                first_doc_number = current_doc_number
+                            last_doc_number = current_doc_number
                             batch.append(doc)
                             if len(batch) >= 1000:
                                 self.db.bulk_upsert_safe(batch)
@@ -163,7 +169,11 @@ class PipelineOrchestrator:
                         if batch:
                             self.db.bulk_upsert_safe(batch)
                             
-                        self.db.mark_file_completed(inner_zip_name)
+                        self.db.mark_file_completed(
+                            inner_zip_name,
+                            first_doc_number=first_doc_number,
+                            last_doc_number=last_doc_number,
+                        )
                     
                     # We have fully processed this file!
                     self.db.update_file_status(file_id, 'COMPLETED')

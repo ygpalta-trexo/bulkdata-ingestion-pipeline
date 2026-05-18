@@ -76,6 +76,8 @@ def main():
 
         batch: List[ExchangeDocument] = []
         doc_count = 0
+        first_doc_number = None
+        last_doc_number = None
         
         # Derive DTD directory from index path. 
         # Index is in Root/index.xml, DTDs are in Root/DTDS
@@ -83,6 +85,10 @@ def main():
         dtd_dir = os.path.join(index_dir, "DTDS")
 
         for doc in process_zip_file(file_path, dtd_dir=dtd_dir):
+            current_doc_number = doc.pub_master.doc_number
+            if first_doc_number is None:
+                first_doc_number = current_doc_number
+            last_doc_number = current_doc_number
             batch.append(doc)
             doc_count += 1
             if len(batch) >= BATCH_SIZE:
@@ -95,7 +101,11 @@ def main():
             db.bulk_upsert_safe(batch)
             
         if not args.dry_run:
-            db.mark_file_completed(filename)
+            db.mark_file_completed(
+                filename,
+                first_doc_number=first_doc_number,
+                last_doc_number=last_doc_number,
+            )
             
         logger.info(f"Completed {filename}: {doc_count} docs.")
         processed_count += 1

@@ -77,6 +77,8 @@ class DatabaseManager:
                     filename TEXT PRIMARY KEY,
                     main_zip_id INTEGER,
                     main_zip_filename TEXT,
+                    first_doc_number TEXT,
+                    last_doc_number TEXT,
                     status TEXT,
                     processed_at TIMESTAMP DEFAULT NOW()
                 );
@@ -158,81 +160,14 @@ class DatabaseManager:
 
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_pub_number
-                    ON patent_documents (country, doc_number, kind_code);
+                CREATE INDEX IF NOT EXISTS idx_patent_documents_country_doc_number
+                    ON patent_documents (country, doc_number);
                 """
             )
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_app_number
-                    ON patent_documents (app_country, app_number, app_kind_code);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_app_doc_id
-                    ON patent_documents (app_doc_id);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_family_id
-                    ON patent_documents (family_id);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_date_publ
-                    ON patent_documents (date_publ);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_is_grant
-                    ON patent_documents (is_grant)
-                    WHERE is_grant = TRUE;
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_parties_gin
-                    ON patent_documents USING GIN (parties jsonb_path_ops);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_priorities_gin
-                    ON patent_documents USING GIN (priorities jsonb_path_ops);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_classifications_gin
-                    ON patent_documents USING GIN (classifications jsonb_path_ops);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_citations_gin
-                    ON patent_documents USING GIN (citations jsonb_path_ops);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_texts_gin
-                    ON patent_documents USING GIN (texts jsonb_path_ops);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_pub_extra_data_gin
-                    ON patent_documents USING GIN (pub_extra_data jsonb_path_ops);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_patent_documents_app_extra_data_gin
-                    ON patent_documents USING GIN (app_extra_data jsonb_path_ops);
+                CREATE INDEX IF NOT EXISTS idx_patent_documents_country_app_number
+                    ON patent_documents (app_country, app_number);
                 """
             )
             self.conn.commit()
@@ -272,26 +207,36 @@ class DatabaseManager:
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO ingestion_checkpoints (filename, main_zip_id, main_zip_filename, status, processed_at)
-                VALUES (%s, %s, %s, 'STARTED', NOW())
+                INSERT INTO ingestion_checkpoints (
+                    filename, main_zip_id, main_zip_filename,
+                    first_doc_number, last_doc_number, status, processed_at
+                )
+                VALUES (%s, %s, %s, NULL, NULL, 'STARTED', NOW())
                 ON CONFLICT (filename) DO UPDATE SET
                     status = 'STARTED',
                     main_zip_id = EXCLUDED.main_zip_id,
                     main_zip_filename = EXCLUDED.main_zip_filename,
+                    first_doc_number = NULL,
+                    last_doc_number = NULL,
                     processed_at = NOW();
                 """,
                 (filename, main_zip_id, main_zip_filename),
             )
             self.conn.commit()
 
-    def mark_file_completed(self, filename: str):
+    def mark_file_completed(self, filename: str, first_doc_number: str = None, last_doc_number: str = None):
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE ingestion_checkpoints SET status = 'COMPLETED', processed_at = NOW()
+                UPDATE ingestion_checkpoints
+                SET
+                    status = 'COMPLETED',
+                    first_doc_number = %s,
+                    last_doc_number = %s,
+                    processed_at = NOW()
                 WHERE filename = %s;
                 """,
-                (filename,),
+                (first_doc_number, last_doc_number, filename),
             )
             self.conn.commit()
 
