@@ -94,12 +94,12 @@ def process_single_zip(
                 batch.append(doc)
                 if len(batch) >= batch_size:
                     if db:
-                        db.bulk_upsert_safe(batch)
+                        db.bulk_upsert_safe(batch, stage_key=stats['filename'])
                     batch = []
 
         # Flush remaining batch
         if not dry_run and batch and db:
-            db.bulk_upsert_safe(batch)
+            db.bulk_upsert_safe(batch, stage_key=stats['filename'])
 
         logger.info(f"Completed {zip_path}: {stats['documents_processed']} documents")
 

@@ -93,12 +93,12 @@ def main():
             doc_count += 1
             if len(batch) >= BATCH_SIZE:
                 if not args.dry_run:
-                    db.bulk_upsert_safe(batch)
+                    db.bulk_upsert_safe(batch, stage_key=filename)
                 batch = []
         
         # Flush remaining
         if batch and not args.dry_run:
-            db.bulk_upsert_safe(batch)
+            db.bulk_upsert_safe(batch, stage_key=filename)
             
         if not args.dry_run:
             db.mark_file_completed(

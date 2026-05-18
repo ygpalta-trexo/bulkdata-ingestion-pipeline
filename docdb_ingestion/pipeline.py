@@ -163,11 +163,11 @@ class PipelineOrchestrator:
                             last_doc_number = current_doc_number
                             batch.append(doc)
                             if len(batch) >= 1000:
-                                self.db.bulk_upsert_safe(batch)
+                                self.db.bulk_upsert_safe(batch, stage_key=inner_zip_name)
                                 batch = []
                                 
                         if batch:
-                            self.db.bulk_upsert_safe(batch)
+                            self.db.bulk_upsert_safe(batch, stage_key=inner_zip_name)
                             
                         self.db.mark_file_completed(
                             inner_zip_name,

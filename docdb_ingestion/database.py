@@ -13,6 +13,37 @@ from .models import ExchangeDocument
 logger = logging.getLogger(__name__)
 
 DEDICATED_COUNTRY_PARTITIONS = {"US", "EP", "WO", "CN", "JP", "KR", "DE", "GB", "FR"}
+STAGE_COLUMNS = [
+    "stage_key",
+    "stage_seq",
+    "country",
+    "pub_doc_id",
+    "doc_number",
+    "kind_code",
+    "extended_kind",
+    "date_publ",
+    "family_id",
+    "is_representative",
+    "is_grant",
+    "originating_office",
+    "date_added_docdb",
+    "date_last_exchange",
+    "app_doc_id",
+    "app_country",
+    "app_number",
+    "app_kind_code",
+    "app_date",
+    "source_status",
+    "app_extra_data",
+    "pub_extra_data",
+    "parties",
+    "priorities",
+    "classifications",
+    "citations",
+    "texts",
+    "designations",
+    "availability_dates",
+]
 
 
 def get_dsn_from_env() -> str:
@@ -152,6 +183,47 @@ class DatabaseManager:
                 """
                 CREATE TABLE IF NOT EXISTS patent_documents_default
                     PARTITION OF patent_documents DEFAULT;
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNLOGGED TABLE IF NOT EXISTS patent_documents_stage (
+                    stage_key TEXT NOT NULL,
+                    stage_seq BIGINT NOT NULL,
+                    country VARCHAR(2),
+                    pub_doc_id VARCHAR(50),
+                    doc_number VARCHAR(50),
+                    kind_code VARCHAR(5),
+                    extended_kind VARCHAR(10),
+                    date_publ DATE,
+                    family_id VARCHAR(50),
+                    is_representative BOOLEAN,
+                    is_grant BOOLEAN,
+                    originating_office VARCHAR(10),
+                    date_added_docdb DATE,
+                    date_last_exchange DATE,
+                    app_doc_id VARCHAR(50),
+                    app_country VARCHAR(2),
+                    app_number VARCHAR(50),
+                    app_kind_code VARCHAR(5),
+                    app_date DATE,
+                    source_status VARCHAR(5),
+                    app_extra_data JSONB,
+                    pub_extra_data JSONB,
+                    parties JSONB,
+                    priorities JSONB,
+                    classifications JSONB,
+                    citations JSONB,
+                    texts JSONB,
+                    designations JSONB,
+                    availability_dates JSONB
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_patent_documents_stage_key
+                    ON patent_documents_stage (stage_key);
                 """
             )
 
@@ -349,76 +421,115 @@ class DatabaseManager:
         }
         return row
 
-    def bulk_upsert_safe(self, documents: List[ExchangeDocument]):
+    def _build_stage_row(self, doc: ExchangeDocument, stage_key: str, stage_seq: int) -> Dict[str, Any]:
+        row = self._build_document_row(doc)
+        row["stage_key"] = stage_key
+        row["stage_seq"] = stage_seq
+        return row
+
+    def _copy_stage_rows(self, cur, stage_rows: List[Dict[str, Any]]):
+        column_sql = ", ".join(STAGE_COLUMNS)
+        with cur.copy(f"COPY patent_documents_stage ({column_sql}) FROM STDIN") as copy:
+            for row in stage_rows:
+                copy.write_row(tuple(row[column] for column in STAGE_COLUMNS))
+
+    def _merge_stage_rows(self, cur, stage_key: str):
+        cur.execute(
+            """
+            WITH latest_rows AS (
+                SELECT DISTINCT ON (country, pub_doc_id)
+                    country, pub_doc_id, doc_number, kind_code, extended_kind, date_publ,
+                    family_id, is_representative, is_grant, originating_office,
+                    date_added_docdb, date_last_exchange,
+                    app_doc_id, app_country, app_number, app_kind_code, app_date,
+                    source_status, app_extra_data, pub_extra_data,
+                    parties, priorities, classifications, citations, texts,
+                    designations, availability_dates
+                FROM patent_documents_stage
+                WHERE stage_key = %s
+                ORDER BY country, pub_doc_id, stage_seq DESC
+            ),
+            deleted AS (
+                DELETE FROM patent_documents target
+                USING latest_rows src
+                WHERE src.source_status IN ('D', 'DV', 'V')
+                  AND target.country = src.country
+                  AND target.pub_doc_id = src.pub_doc_id
+            )
+            INSERT INTO patent_documents (
+                country, pub_doc_id, doc_number, kind_code, extended_kind, date_publ,
+                family_id, is_representative, is_grant, originating_office,
+                date_added_docdb, date_last_exchange,
+                app_doc_id, app_country, app_number, app_kind_code, app_date,
+                source_status, app_extra_data, pub_extra_data,
+                parties, priorities, classifications, citations, texts,
+                designations, availability_dates, updated_at
+            )
+            SELECT
+                country, pub_doc_id, doc_number, kind_code, extended_kind, date_publ,
+                family_id, is_representative, is_grant, originating_office,
+                date_added_docdb, date_last_exchange,
+                app_doc_id, app_country, app_number, app_kind_code, app_date,
+                source_status, app_extra_data, pub_extra_data,
+                parties, priorities, classifications, citations, texts,
+                designations, availability_dates, NOW()
+            FROM latest_rows
+            WHERE source_status NOT IN ('D', 'DV', 'V')
+            ON CONFLICT (country, pub_doc_id) DO UPDATE
+            SET
+                doc_number = EXCLUDED.doc_number,
+                kind_code = EXCLUDED.kind_code,
+                extended_kind = EXCLUDED.extended_kind,
+                date_publ = EXCLUDED.date_publ,
+                family_id = EXCLUDED.family_id,
+                is_representative = EXCLUDED.is_representative,
+                is_grant = EXCLUDED.is_grant,
+                originating_office = EXCLUDED.originating_office,
+                date_added_docdb = EXCLUDED.date_added_docdb,
+                date_last_exchange = EXCLUDED.date_last_exchange,
+                app_doc_id = EXCLUDED.app_doc_id,
+                app_country = EXCLUDED.app_country,
+                app_number = EXCLUDED.app_number,
+                app_kind_code = EXCLUDED.app_kind_code,
+                app_date = EXCLUDED.app_date,
+                source_status = EXCLUDED.source_status,
+                app_extra_data = EXCLUDED.app_extra_data,
+                pub_extra_data = EXCLUDED.pub_extra_data,
+                parties = EXCLUDED.parties,
+                priorities = EXCLUDED.priorities,
+                classifications = EXCLUDED.classifications,
+                citations = EXCLUDED.citations,
+                texts = EXCLUDED.texts,
+                designations = EXCLUDED.designations,
+                availability_dates = EXCLUDED.availability_dates,
+                updated_at = NOW();
+            """,
+            (stage_key,),
+        )
+
+    def bulk_upsert_safe(self, documents: List[ExchangeDocument], stage_key: str):
         if not documents:
             return
 
-        logger.info("Beginning transaction for batch upsert of %s documents.", len(documents))
+        logger.info(
+            "Beginning staged batch upsert of %s documents for stage_key=%s.",
+            len(documents),
+            stage_key,
+        )
 
         with self.conn.cursor() as cur:
-            for doc in documents:
-                country = (doc.pub_master.country or "").strip().upper()
-
-                if doc.operation.upper() in ("D", "DV", "V"):
-                    cur.execute(
-                        """
-                        DELETE FROM patent_documents
-                        WHERE country = %s AND pub_doc_id = %s;
-                        """,
-                        (country, doc.pub_master.pub_doc_id),
-                    )
-                    continue
-
-                row = self._build_document_row(doc)
-                cur.execute(
-                    """
-                    INSERT INTO patent_documents (
-                        country, pub_doc_id, doc_number, kind_code, extended_kind, date_publ,
-                        family_id, is_representative, is_grant, originating_office,
-                        date_added_docdb, date_last_exchange,
-                        app_doc_id, app_country, app_number, app_kind_code, app_date,
-                        source_status, app_extra_data, pub_extra_data,
-                        parties, priorities, classifications, citations, texts,
-                        designations, availability_dates, updated_at
-                    ) VALUES (
-                        %(country)s, %(pub_doc_id)s, %(doc_number)s, %(kind_code)s, %(extended_kind)s, %(date_publ)s,
-                        %(family_id)s, %(is_representative)s, %(is_grant)s, %(originating_office)s,
-                        %(date_added_docdb)s, %(date_last_exchange)s,
-                        %(app_doc_id)s, %(app_country)s, %(app_number)s, %(app_kind_code)s, %(app_date)s,
-                        %(source_status)s, %(app_extra_data)s, %(pub_extra_data)s,
-                        %(parties)s, %(priorities)s, %(classifications)s, %(citations)s, %(texts)s,
-                        %(designations)s, %(availability_dates)s, NOW()
-                    )
-                    ON CONFLICT (country, pub_doc_id) DO UPDATE
-                    SET
-                        doc_number = EXCLUDED.doc_number,
-                        kind_code = EXCLUDED.kind_code,
-                        extended_kind = EXCLUDED.extended_kind,
-                        date_publ = EXCLUDED.date_publ,
-                        family_id = EXCLUDED.family_id,
-                        is_representative = EXCLUDED.is_representative,
-                        is_grant = EXCLUDED.is_grant,
-                        originating_office = EXCLUDED.originating_office,
-                        date_added_docdb = EXCLUDED.date_added_docdb,
-                        date_last_exchange = EXCLUDED.date_last_exchange,
-                        app_doc_id = EXCLUDED.app_doc_id,
-                        app_country = EXCLUDED.app_country,
-                        app_number = EXCLUDED.app_number,
-                        app_kind_code = EXCLUDED.app_kind_code,
-                        app_date = EXCLUDED.app_date,
-                        source_status = EXCLUDED.source_status,
-                        app_extra_data = EXCLUDED.app_extra_data,
-                        pub_extra_data = EXCLUDED.pub_extra_data,
-                        parties = EXCLUDED.parties,
-                        priorities = EXCLUDED.priorities,
-                        classifications = EXCLUDED.classifications,
-                        citations = EXCLUDED.citations,
-                        texts = EXCLUDED.texts,
-                        designations = EXCLUDED.designations,
-                        availability_dates = EXCLUDED.availability_dates,
-                        updated_at = NOW();
-                    """,
-                    row,
-                )
-
+            cur.execute(
+                "DELETE FROM patent_documents_stage WHERE stage_key = %s;",
+                (stage_key,),
+            )
+            stage_rows = [
+                self._build_stage_row(doc, stage_key, stage_seq)
+                for stage_seq, doc in enumerate(documents, start=1)
+            ]
+            self._copy_stage_rows(cur, stage_rows)
+            self._merge_stage_rows(cur, stage_key)
+            cur.execute(
+                "DELETE FROM patent_documents_stage WHERE stage_key = %s;",
+                (stage_key,),
+            )
             self.conn.commit()
