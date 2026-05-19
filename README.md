@@ -78,6 +78,37 @@ You can split the workload across multiple terminal sessions or test small batch
 python -m docdb_ingestion.pipeline run --start-index 11 --limit 5
 ```
 
+### Configurable batch size and tuning
+
+You can control how many documents are staged in each bulk upsert using the `DOCDB_BATCH_SIZE` environment variable or the `--batch-size` CLI option (CLI overrides env). The default is 2000.
+
+Examples:
+
+```bash
+# Set globally for the session
+export DOCDB_BATCH_SIZE=5000
+
+# Or pass per run (overrides env)
+python -m docdb_ingestion.pipeline run --start-index 1 --limit 10 --batch-size 5000
+
+# Dry-run using process_folder.py (does not write to DB)
+DOCDB_BATCH_SIZE=2000 python process_folder.py /path/to/sample/zips --dry-run --limit 1
+```
+
+Recommended tuning approach:
+
+- Test progressively: try 2k → 5k → 10k and measure per-batch wall time, DB CPU, I/O and transaction duration.
+- Prefer batch wall-times in the single-digit seconds if you run many parallel workers; longer single-batch times increase lock durations and rollback cost.
+- If DB CPU or iowait exceed ~70% or commit durations exceed ~20s, lower batch size or reduce concurrent workers.
+
+Monitoring checklist while tuning:
+
+- `top`/`htop` for CPU and iowait
+- `SELECT now()-query_start AS duration, state, query FROM pg_stat_activity WHERE state <> 'idle';`
+- `pg_stat_progress_copy`, `pg_stat_bgwriter` and `pg_stat_database` for WAL/checkpoint pressure
+- Disk free space and replication lag (if applicable)
+
+
 All process output will be saved both to STANDARD OUT and into daily rolling logs located in `logs/<YYYY-MM-DD>/pipeline.log`.
 
 ## Data Schema Summary

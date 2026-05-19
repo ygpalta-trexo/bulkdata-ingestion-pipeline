@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument("--dry-run", action="store_true", help="Process files but do not write to DB")
     parser.add_argument("--force", action="store_true", help="Re-process files even if completed")
+    parser.add_argument("--batch-size", type=int, help="Number of documents to stage per upsert batch (overrides DOCDB_BATCH_SIZE env)")
 
     args = parser.parse_args()
 
@@ -55,6 +56,8 @@ def main():
         db.connect()
 
     processed_count = 0
+    # Effective batch size: CLI arg > env var > default constant
+    batch_size = args.batch_size or int(os.environ.get('DOCDB_BATCH_SIZE', str(BATCH_SIZE)))
     
     for pkg in package_files:
         filename = pkg['filename']
@@ -91,7 +94,7 @@ def main():
             last_doc_number = current_doc_number
             batch.append(doc)
             doc_count += 1
-            if len(batch) >= BATCH_SIZE:
+            if len(batch) >= batch_size:
                 if not args.dry_run:
                     db.bulk_upsert_safe(batch, stage_key=filename)
                 batch = []

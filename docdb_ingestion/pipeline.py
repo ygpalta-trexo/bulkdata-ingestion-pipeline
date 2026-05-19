@@ -55,7 +55,7 @@ class PipelineOrchestrator:
         self.db.sync_delivery_files(self.product_id, self.delivery_id, files)
         logger.info(f"Successfully synchronized {len(files)} files to the database.")
 
-    def run(self, start_index=1, limit=None, retry_failed=False):
+    def run(self, start_index=1, limit=None, retry_failed=False, batch_size_arg: int = None):
         """Main execution loop for downloading, extracting, and processing files."""
         logger.info("Starting pipeline execution loop...")
         
@@ -79,6 +79,9 @@ class PipelineOrchestrator:
             
         logger.info(f"Found {len(all_files)} files to process.")
         
+        # Determine effective batch size: CLI arg > env var > default
+        batch_size = int(os.environ.get('DOCDB_BATCH_SIZE', str(batch_size_arg or 1000)))
+
         for file_rec in all_files:
             file_id = file_rec['file_id']
             filename = file_rec['filename']
@@ -88,6 +91,11 @@ class PipelineOrchestrator:
             if status in skip_statuses:
                 logger.info(f"Skipping already '{status}' file ID {file_id}: {filename}")
                 continue
+
+            # if filename.lower().endswith('.csv'):
+            #     logger.info(f"Skipping front file (non-ZIP): {filename}")
+            #     self.db.update_file_status(file_id, 'COMPLETED')
+            #     continue
                 
             if status == 'FAILED' and retry_failed:
                 logger.info(f"Retrying 'FAILED' file ID {file_id}: {filename}")
@@ -178,7 +186,7 @@ class PipelineOrchestrator:
                                 first_doc_number = current_doc_number
                             last_doc_number = current_doc_number
                             batch.append(doc)
-                            if len(batch) >= 1000:
+                            if len(batch) >= batch_size:
                                 self.db.bulk_upsert_safe(batch, stage_key=inner_zip_name)
                                 batch = []
                                 
@@ -203,6 +211,11 @@ class PipelineOrchestrator:
                 logger.error(f"Error processing file ID {file_id}: {e}")
                 import traceback
                 error_msg = traceback.format_exc()
+                
+                # # Rollback current transaction state before logging FAILED
+                # if hasattr(self.db, 'conn') and self.db.conn:
+                #     self.db.conn.rollback()
+                    
                 self.db.update_file_status(file_id, 'FAILED', error_msg)
                 
                 # Try to clean up on failure
@@ -222,6 +235,7 @@ def main():
     parser.add_argument("--retry-failed", action="store_true", help="Retry processing for files with 'FAILED' status")
     parser.add_argument("--log-file", help="Explicit log file path for this worker/process")
     parser.add_argument("--worker-name", help="Worker label used in the default log filename, e.g. worker1")
+    parser.add_argument("--batch-size", type=int, help="Number of documents to stage per upsert batch (overrides DOCDB_BATCH_SIZE env)")
     
     args = parser.parse_args()
 
@@ -250,7 +264,7 @@ def main():
     if cmd == 'sync':
         orchestrator.sync()
     elif cmd == 'run':
-        orchestrator.run(start_index=args.start_index, limit=args.limit, retry_failed=args.retry_failed)
+        orchestrator.run(start_index=args.start_index, limit=args.limit, retry_failed=args.retry_failed, batch_size_arg=args.batch_size)
     else:
         logger.error(f"Unknown command: {cmd}")
 

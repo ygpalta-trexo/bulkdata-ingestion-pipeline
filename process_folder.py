@@ -154,11 +154,15 @@ Examples:
     parser.add_argument("--pattern", default="*.zip", help="File pattern to match (default: *.zip)")
     parser.add_argument("--dtd-dir", help="Path to DTD directory for XML validation")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--batch-size", type=int, help="Number of documents to stage per upsert batch (overrides DOCDB_BATCH_SIZE env)")
 
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Effective batch size: CLI arg > env var > default constant
+    batch_size = args.batch_size or int(os.environ.get('DOCDB_BATCH_SIZE', str(BATCH_SIZE)))
 
     try:
         db = None
@@ -212,7 +216,8 @@ Examples:
                     zip_path,
                     dtd_dir=dtd_dir,
                     dry_run=args.dry_run,
-                    db=db
+                    db=db,
+                    batch_size=batch_size,
                 )
                 results.append(stats)
                 total_processed += stats['documents_processed']
