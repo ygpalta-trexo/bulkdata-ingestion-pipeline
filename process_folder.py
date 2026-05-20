@@ -199,17 +199,37 @@ Examples:
         results = []
         total_processed = 0
 
+        def discover_dtd_dir(zip_path: str, explicit_dtd_dir: Optional[str] = None) -> Optional[str]:
+            if explicit_dtd_dir and os.path.exists(explicit_dtd_dir):
+                return explicit_dtd_dir
+
+            zip_dir = os.path.dirname(zip_path)
+            candidates = [
+                os.path.join(zip_dir, "DTDS"),
+                os.path.join(zip_dir, os.pardir, "DTDS"),
+                os.path.join(zip_dir, os.pardir, os.pardir, "DTDS"),
+            ]
+
+            for candidate in candidates:
+                normalized = os.path.abspath(candidate)
+                if os.path.exists(normalized):
+                    return normalized
+
+            return None
+
         for zip_path in zip_files:
             try:
                 # Determine DTD directory
-                dtd_dir = args.dtd_dir
-                if not dtd_dir:
-                    # Try to find DTDS directory relative to the ZIP file
-                    zip_dir = os.path.dirname(zip_path)
-                    potential_dtd_dir = os.path.join(zip_dir, "DTDS")
-                    if os.path.exists(potential_dtd_dir):
-                        dtd_dir = potential_dtd_dir
-                        logger.debug(f"Using DTD directory: {dtd_dir}")
+                dtd_dir = discover_dtd_dir(zip_path, explicit_dtd_dir=args.dtd_dir)
+                if dtd_dir:
+                    logger.debug(f"Using DTD directory: {dtd_dir}")
+                elif args.dtd_dir:
+                    logger.warning(f"Requested DTD directory does not exist: {args.dtd_dir}")
+                else:
+                    logger.warning(
+                        f"No DTD directory found for {zip_path}. "
+                        "If XML uses entities, pass --dtd-dir to a folder containing docdb-entities.dtd"
+                    )
 
                 # Process the ZIP file — streaming batch writes inside
                 stats = process_single_zip(

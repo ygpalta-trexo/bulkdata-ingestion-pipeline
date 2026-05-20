@@ -144,11 +144,13 @@ def process_zip_file(zip_path: str, dtd_dir: Optional[str] = None) -> Iterator[E
             xml_filename = None
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 for info in zf.infolist():
-                    if info.filename.endswith('.xml'):
+                    # Preserve any DTD/XSD/ENTITY files that the XML may reference.
+                    if info.filename.endswith(('.xml', '.dtd', '.xsd', '.ent')):
                         zf.extract(info, temp_dir)
+
+                    if info.filename.endswith('.xml') and xml_filename is None:
                         xml_filename = info.filename
-                        break
-            
+
             if not xml_filename:
                 logger.warning(f"No XML file found in {zip_path}")
                 return
@@ -555,7 +557,7 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     # Log any unhandled data for debugging
     if pub_extra_data or app_extra_data:
         unhandled = list(pub_extra_data.keys()) + list(app_extra_data.keys())
-        logger.info(f"Document {pub_doc_id} has unhandled fields: {unhandled}")
+        logger.debug(f"Document {pub_doc_id} has unhandled fields: {unhandled}")
         logger.debug(f"Unhandled pub data: {pub_extra_data} | Unhandled app data: {app_extra_data}")
     
     app_master.extra_data = app_extra_data if app_extra_data else {}

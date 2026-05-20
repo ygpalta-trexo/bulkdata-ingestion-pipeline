@@ -66,6 +66,9 @@ The pipeline will query the API, identify pending files, download them into `tmp
 python -m docdb_ingestion.pipeline sync
 ```
 
+   - When using `BACKFILE_TIME`, the first catch-up sync will ingest all weekly deliveries published after that cutoff.
+   - For ongoing weekly runs, use `--latest-only` to sync only the newest available delivery.
+
 2. Start the automated ingestion loop:
 ```bash
 python -m docdb_ingestion.pipeline run

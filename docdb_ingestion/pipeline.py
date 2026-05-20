@@ -3,14 +3,46 @@ import logging
 import zipfile
 import shutil
 import glob
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
 from .database import DatabaseManager, get_dsn_from_env
-from .epo_api import get_delivery_files, download_file
+from .epo_api import get_delivery_files, get_product_deliveries, download_file
 from .stream_processor import process_zip_file
 
 logger = logging.getLogger(__name__)
+
+
+def extract_week_number(delivery_name: str) -> str:
+    """
+    Extract week number from delivery name like "14.7 DOCDB - EPO worldwide bibliographic data 2026/020 Amend".
+    Returns a string like "2026/020" or None if not found.
+    """
+    if not delivery_name:
+        return None
+    match = re.search(r'(\d{4})/(\d{3})', delivery_name)
+    if match:
+        return f"{match.group(1)}/{match.group(2)}"
+    return None
+
+
+def determine_processing_order(delivery_name: str) -> int:
+    """
+    Determine the processing order for a delivery based on its name.
+    Order 1: CreateDelete/Cr-Del
+    Order 2: Amend
+    Order 999: Other
+    """
+    if not delivery_name:
+        return 999
+    name_lower = delivery_name.lower()
+    if 'createdelete' in name_lower or 'cr-del' in name_lower:
+        return 1
+    elif 'amend' in name_lower:
+        return 2
+    else:
+        return 999
 
 
 def resolve_pipeline_log_file(worker_name: str = None, explicit_log_file: str = None) -> str:
@@ -30,9 +62,11 @@ def resolve_pipeline_log_file(worker_name: str = None, explicit_log_file: str = 
 class PipelineOrchestrator:
     def __init__(self):
         self.dsn = get_dsn_from_env()
-            
+        
         self.product_id = int(os.environ.get("EPO_PRODUCT_ID", 14))
-        self.delivery_id = int(os.environ.get("EPO_DELIVERY_ID", 3071))
+        delivery_id_env = os.environ.get("EPO_DELIVERY_ID")
+        self.delivery_id = int(delivery_id_env) if delivery_id_env else None
+        self.backfile_time = self._parse_backfile_time(os.environ.get("BACKFILE_TIME"))
         self.temp_dir = os.environ.get("EPO_TEMP_DIR", "./tmp_downloads")
         
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -40,29 +74,138 @@ class PipelineOrchestrator:
         self.db = DatabaseManager(self.dsn)
         self.db.connect()
 
+    def _parse_backfile_time(self, value: str):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            raise ValueError(
+                f"Invalid BACKFILE_TIME format: {value}. "
+                "Use ISO-8601, for example 2026-02-24T10:50:03.000+01:00"
+            )
+
+    @staticmethod
+    def _is_zip_file(filename: str) -> bool:
+        return bool(filename and filename.lower().endswith('.zip'))
+
+    @staticmethod
+    def _inner_zip_sort_key(filename: str):
+        name = os.path.basename(filename).lower() if filename else ""
+        if 'deleterekey' in name or 'rekey' in name:
+            order = 1
+        elif 'createdelete' in name or 'cr-del' in name or 'createdelete' in name or '_cd' in name:
+            order = 2
+        elif 'amend' in name or '_am' in name:
+            order = 3
+        elif 'create' in name:
+            order = 4
+        else:
+            order = 5
+        return (order, name)
+
     def __del__(self):
         if hasattr(self, 'db'):
             self.db.close()
 
-    def sync(self):
-        """Fetches the latest file list from the API and saves it to the DB."""
+    def sync(self, latest_only: bool = False, delivery_id_arg: int = None):
+        """Fetches the file manifest from the API and saves matching files to the DB."""
         logger.info("Synchronizing delivery files with EPO API...")
-        files = get_delivery_files(self.product_id, self.delivery_id)
-        if not files:
-            logger.warning("No files found to sync.")
+        delivery_id = delivery_id_arg or self.delivery_id
+
+        if delivery_id is not None:
+            deliveries = [{
+                'delivery_id': delivery_id,
+                'delivery_name': None,
+                'delivery_publication_datetime': None,
+                'files': get_delivery_files(self.product_id, delivery_id),
+            }]
+        else:
+            deliveries = get_product_deliveries(self.product_id)
+            if self.backfile_time:
+                deliveries = [
+                    d for d in deliveries
+                    if any(
+                        f.get('file_publication_datetime') and f['file_publication_datetime'] > self.backfile_time
+                        for f in d.get('files', [])
+                    )
+                ]
+
+            if not deliveries:
+                logger.warning("No deliveries found to sync.")
+                return
+
+            if latest_only or not self.backfile_time:
+                deliveries = [
+                    max(deliveries, key=lambda d: d.get('delivery_publication_datetime') or datetime.min)
+                ]
+            else:
+                deliveries = sorted(
+                    deliveries,
+                    key=lambda d: d.get('delivery_publication_datetime') or datetime.min,
+                )
+
+        total_files = 0
+        for delivery in deliveries:
+            files = [f for f in delivery.get('files', []) if self._is_zip_file(f.get('filename'))]
+            if self.backfile_time:
+                files = [
+                    f for f in files
+                    if f.get('file_publication_datetime') and f['file_publication_datetime'] > self.backfile_time
+                ]
+
+            if not files:
+                logger.warning(
+                    f"Skipping delivery {delivery.get('delivery_id')} because no ZIP files matched the delivery filters."
+                )
+                continue
+
+            # Extract week number and processing order from delivery name
+            delivery_name = delivery.get('delivery_name')
+            week_number = extract_week_number(delivery_name)
+            processing_order = determine_processing_order(delivery_name)
+            
+            self.db.sync_delivery_files(
+                self.product_id,
+                delivery['delivery_id'],
+                files,
+                week_number=week_number,
+                processing_order=processing_order,
+                delivery_name=delivery_name
+            )
+            total_files += len(files)
+            logger.info(
+                f"Synchronized delivery {delivery.get('delivery_id')} ({delivery_name}) "
+                f"with {len(files)} files (week: {week_number}, order: {processing_order})."
+            )
+
+        if total_files == 0:
+            logger.warning("No files were synchronized.")
             return
 
-        self.db.sync_delivery_files(self.product_id, self.delivery_id, files)
-        logger.info(f"Successfully synchronized {len(files)} files to the database.")
+        logger.info(f"Successfully synchronized {total_files} files to the database.")
 
     def run(self, start_index=1, limit=None, retry_failed=False, batch_size_arg: int = None):
         """Main execution loop for downloading, extracting, and processing files."""
         logger.info("Starting pipeline execution loop...")
         
-        all_files = self.db.get_all_delivery_files(self.product_id, self.delivery_id)
+        if self.delivery_id is not None:
+            all_files = self.db.get_all_delivery_files(self.product_id, self.delivery_id)
+        else:
+            all_files = self.db.get_all_delivery_files_for_product(self.product_id)
+
+        if self.backfile_time:
+            all_files = [
+                f for f in all_files
+                if f.get('file_publication_datetime') and f['file_publication_datetime'] > self.backfile_time
+            ]
+
         if not all_files:
             logger.info("No delivery files found. Pipeline is idle.")
             return
+
+        # Files are already sorted by database query (week_number, processing_order, file_id)
+        # No additional Python-based sorting needed
             
         # Apply start-index (1-based index)
         if start_index > 1:
@@ -92,11 +235,11 @@ class PipelineOrchestrator:
                 logger.info(f"Skipping already '{status}' file ID {file_id}: {filename}")
                 continue
 
-            # if filename.lower().endswith('.csv'):
-            #     logger.info(f"Skipping front file (non-ZIP): {filename}")
-            #     self.db.update_file_status(file_id, 'COMPLETED')
-            #     continue
-                
+            if not self._is_zip_file(filename):
+                logger.info(f"Skipping non-ZIP frontfile payload: {filename}")
+                self.db.update_file_status(file_id, 'COMPLETED')
+                continue
+
             if status == 'FAILED' and retry_failed:
                 logger.info(f"Retrying 'FAILED' file ID {file_id}: {filename}")
                 status = 'PENDING'
@@ -114,7 +257,7 @@ class PipelineOrchestrator:
                     if os.path.exists(dest_zip_path):
                         os.remove(dest_zip_path)
                         
-                    download_file(self.product_id, self.delivery_id, file_id, dest_zip_path)
+                    download_file(self.product_id, file_rec.get('delivery_id'), file_id, dest_zip_path)
                     self.db.update_file_status(file_id, 'DOWNLOADED')
                     status = 'DOWNLOADED'
 
@@ -145,14 +288,7 @@ class PipelineOrchestrator:
                     internal_zips_raw = glob.glob(os.path.join(extract_dir, '**/*.zip'), recursive=True)
                     
                     # Skill rule: Mandatory ZIP processing order to handle re-keys and prevent pk collisions
-                    def zip_sort_priority(filename):
-                        base = os.path.basename(filename)
-                        if 'DeleteRekey' in base: return 1
-                        if 'CreateDelete' in base: return 2
-                        if 'Amend' in base: return 3
-                        return 4 # Unknowns or others at the end
-                        
-                    internal_zips = sorted(internal_zips_raw, key=zip_sort_priority)
+                    internal_zips = sorted(internal_zips_raw, key=self._inner_zip_sort_key)
                     
                     dtd_dir = None
                     for d in ['Root/DTDS', 'DTDS', 'Schema']:
@@ -236,6 +372,8 @@ def main():
     parser.add_argument("--log-file", help="Explicit log file path for this worker/process")
     parser.add_argument("--worker-name", help="Worker label used in the default log filename, e.g. worker1")
     parser.add_argument("--batch-size", type=int, help="Number of documents to stage per upsert batch (overrides DOCDB_BATCH_SIZE env)")
+    parser.add_argument("--delivery-id", type=int, help="Delivery id to sync and process")
+    parser.add_argument("--latest-only", action="store_true", help="When syncing without a delivery id, only sync the latest delivery instead of all deliveries after BACKFILE_TIME")
     
     args = parser.parse_args()
 
@@ -262,7 +400,7 @@ def main():
     orchestrator = PipelineOrchestrator()
     
     if cmd == 'sync':
-        orchestrator.sync()
+        orchestrator.sync(latest_only=args.latest_only, delivery_id_arg=args.delivery_id)
     elif cmd == 'run':
         orchestrator.run(start_index=args.start_index, limit=args.limit, retry_failed=args.retry_failed, batch_size_arg=args.batch_size)
     else:

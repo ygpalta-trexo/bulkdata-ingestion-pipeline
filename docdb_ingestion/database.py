@@ -91,6 +91,7 @@ class DatabaseManager:
                     product_id INT,
                     delivery_id INT,
                     filename VARCHAR(500),
+                    file_publication_datetime TIMESTAMPTZ,
                     status VARCHAR(20) DEFAULT 'PENDING',
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
@@ -99,7 +100,28 @@ class DatabaseManager:
                 """
             )
             cur.execute(
+                """
+                ALTER TABLE delivery_files
+                ADD COLUMN IF NOT EXISTS file_publication_datetime TIMESTAMPTZ;
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE delivery_files
+                ADD COLUMN IF NOT EXISTS week_number VARCHAR(20);
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE delivery_files
+                ADD COLUMN IF NOT EXISTS processing_order INT DEFAULT 999;
+                """
+            )
+            cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_files (status);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delivery_week_order ON delivery_files (week_number, processing_order);"
             )
 
             cur.execute(
@@ -312,16 +334,49 @@ class DatabaseManager:
             )
             self.conn.commit()
 
-    def sync_delivery_files(self, product_id: int, delivery_id: int, files_data: List[dict]):
+    def sync_delivery_files(self, product_id: int, delivery_id: int, files_data: List[dict], week_number: str = None, processing_order: int = 999, delivery_name: str = None):
+        """Sync delivery files with optional week_number and processing_order."""
+        # Auto-detect processing order if delivery_name provided
+        if delivery_name and not processing_order:
+            name_lower = delivery_name.lower()
+            if 'createdelete' in name_lower or 'cr-del' in name_lower:
+                processing_order = 1
+            elif 'amend' in name_lower:
+                processing_order = 2
+            else:
+                processing_order = 999
+        
         with self.conn.cursor() as cur:
             for item in files_data:
                 cur.execute(
                     """
-                    INSERT INTO delivery_files (file_id, product_id, delivery_id, filename, status)
-                    VALUES (%s, %s, %s, %s, 'PENDING')
-                    ON CONFLICT (file_id) DO NOTHING;
+                    INSERT INTO delivery_files (
+                        file_id,
+                        product_id,
+                        delivery_id,
+                        filename,
+                        file_publication_datetime,
+                        week_number,
+                        processing_order,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'PENDING')
+                    ON CONFLICT (file_id) DO UPDATE SET
+                        filename = EXCLUDED.filename,
+                        file_publication_datetime = COALESCE(EXCLUDED.file_publication_datetime, delivery_files.file_publication_datetime),
+                        week_number = COALESCE(EXCLUDED.week_number, delivery_files.week_number),
+                        processing_order = COALESCE(EXCLUDED.processing_order, delivery_files.processing_order),
+                        updated_at = NOW();
                     """,
-                    (item["file_id"], product_id, delivery_id, item["filename"]),
+                    (
+                        item["file_id"],
+                        product_id,
+                        delivery_id,
+                        item["filename"],
+                        item.get("file_publication_datetime"),
+                        week_number,
+                        processing_order,
+                    ),
                 )
             self.conn.commit()
 
@@ -338,6 +393,19 @@ class DatabaseManager:
             )
             return [dict(row) for row in cur.fetchall()]
 
+    def get_actionable_files_for_product(self, product_id: int) -> List[dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM delivery_files
+                WHERE product_id = %s
+                  AND status NOT IN ('COMPLETED', 'FAILED')
+                ORDER BY delivery_id ASC, file_id ASC;
+                """,
+                (product_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
     def get_all_delivery_files(self, product_id: int, delivery_id: int) -> List[dict]:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -347,6 +415,18 @@ class DatabaseManager:
                 ORDER BY file_id ASC;
                 """,
                 (product_id, delivery_id),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_all_delivery_files_for_product(self, product_id: int) -> List[dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM delivery_files
+                WHERE product_id = %s
+                ORDER BY COALESCE(week_number, '9999/999') ASC, processing_order ASC, file_id ASC;
+                """,
+                (product_id,),
             )
             return [dict(row) for row in cur.fetchall()]
 
