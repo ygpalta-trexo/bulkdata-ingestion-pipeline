@@ -298,6 +298,138 @@ nohup python -m docdb_ingestion.pipeline run \
   > logs/server2_worker1.out 2>&1 &
 ```
 
+## Front-file ingestion (weekly updates)
+
+The front-file runner (`frontfile_runner.py`) handles ongoing weekly deliveries from the EPO DOCDB front-file product. It is separate from the backfile pipeline: the backfile pipeline processes a fixed historical snapshot using `python -m docdb_ingestion.pipeline`, while the front-file runner continuously ingests new weekly publications after the backfile cutoff.
+
+### How it works
+
+The runner fetches all deliveries for the front-file product from the EPO API, filters to those published **after** `BACKFILE_TIME`, groups them by ISO week (`YYYY/NNN`), and processes them in the correct intra-week order:
+
+1. **DeleteRekey** — must run first; re-keys existing primary keys
+2. **CreateDelete** — creates and deletes records for the week
+3. **Amend** — amends existing records
+
+If any delivery fails the runner **halts immediately** and does not proceed to the next week. This prevents corrupting subsequent weeks with an incomplete base.
+
+### Required `.env` variables
+
+In addition to the standard database variables, set:
+
+```
+EPO_FRONTFILE_PRODUCT_ID=3          # product ID for the front-file (check with EPO)
+BACKFILE_TIME=2026-02-24T10:50:03.000+01:00   # ISO-8601; deliveries on/before this are skipped
+```
+
+Optional overrides (all have sensible defaults):
+
+```
+EPO_API_BASE_URL=https://...        # override EPO API base URL
+EPO_TEMP_DIR=./tmp                  # temp download/extraction directory
+PIPELINE_LOG_FILE=/path/to/log      # explicit log file path
+PIPELINE_WORKER_NAME=frontfile      # label used in default log filename
+DOCDB_BATCH_SIZE=2000               # upsert batch size
+```
+
+### Dry run — preview the execution plan
+
+Always run a dry-run first to see what weeks and deliveries would be processed, in what order, without downloading anything:
+
+```bash
+python frontfile_runner.py --mode catchup --dry-run
+python frontfile_runner.py --mode latest  --dry-run
+```
+
+### Catch-up run — process all weeks after BACKFILE_TIME
+
+Use this when running for the first time after the backfile completes, or to re-process a gap:
+
+```bash
+nohup python frontfile_runner.py --mode catchup \
+  > logs/frontfile_catchup.out 2>&1 &
+```
+
+To control batch size:
+
+```bash
+nohup python frontfile_runner.py --mode catchup \
+  --batch-size 5000 \
+  --worker-name frontfile_catchup \
+  > logs/frontfile_catchup.out 2>&1 &
+```
+
+The runner will process every week it finds, in ascending chronological order, halting on the first failure.
+
+### Latest run — process only the most recent week (weekly cron)
+
+Use this for the regular weekly update job. It limits processing to the single newest week found after `BACKFILE_TIME`:
+
+```bash
+python frontfile_runner.py --mode latest
+```
+
+Or as a background job:
+
+```bash
+nohup python frontfile_runner.py --mode latest \
+  --worker-name frontfile_weekly \
+  > logs/frontfile_weekly.out 2>&1 &
+```
+
+Typical cron entry (every Monday at 06:00, after EPO publishes the weekly delivery):
+
+```
+0 6 * * 1 cd /path/to/docdb_ingestion && source .venv/bin/activate && python frontfile_runner.py --mode latest >> logs/cron.out 2>&1
+```
+
+### Retry after a failure
+
+If the runner halted on a failed delivery, fix the underlying issue (disk space, DB connectivity, bad ZIP), then re-run with `--retry-failed`:
+
+```bash
+# Catchup: retry all weeks that had failures
+python frontfile_runner.py --mode catchup --retry-failed
+
+# Latest: retry just the most recent week
+python frontfile_runner.py --mode latest --retry-failed
+```
+
+### View logs
+
+Shell output:
+
+```bash
+tail -f logs/frontfile_catchup.out
+```
+
+Application log (written to `logs/<date>/pipeline_frontfile.log` by default):
+
+```bash
+tail -f logs/$(date +%F)/pipeline_frontfile.log
+```
+
+Use `--log-file` or `--worker-name` to control the log destination:
+
+```bash
+python frontfile_runner.py --mode latest \
+  --worker-name weekly \
+  --log-file /var/log/docdb/frontfile.log
+```
+
+### Check if the runner is still going
+
+```bash
+ps -ef | grep frontfile_runner | grep -v grep
+```
+
+### Stop the runner
+
+```bash
+pkill -f frontfile_runner.py
+```
+
+---
+
 ## Notes
 
 - The pipeline is safe to leave running for long periods.

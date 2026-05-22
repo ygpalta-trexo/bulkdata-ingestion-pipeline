@@ -119,6 +119,34 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS idx_checkpoints_status ON ingestion_checkpoints (status);"
             )
 
+            # ── Delivery-level audit log (front-file runs only) ────────────────
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS frontfile_delivery_audit (
+                    id              BIGSERIAL PRIMARY KEY,
+                    delivery_id     INT NOT NULL,
+                    product_id      INT NOT NULL,
+                    delivery_name   TEXT,
+                    week_number     TEXT,
+                    runner_mode     TEXT,
+                    started_at      TIMESTAMPTZ,
+                    completed_at    TIMESTAMPTZ DEFAULT NOW(),
+                    status          TEXT,
+                    total_files     INT,
+                    docs_upserted   INT,
+                    docs_deleted    INT,
+                    docs_skipped    INT,
+                    error_message   TEXT
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_fda_delivery_id
+                    ON frontfile_delivery_audit (delivery_id);
+                """
+            )
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS patent_documents (
@@ -511,12 +539,6 @@ class DatabaseManager:
         if not documents:
             return
 
-        logger.info(
-            "Beginning staged batch upsert of %s documents for stage_key=%s.",
-            len(documents),
-            stage_key,
-        )
-
         with self.conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM patent_documents_stage WHERE stage_key = %s;",
@@ -533,3 +555,53 @@ class DatabaseManager:
                 (stage_key,),
             )
             self.conn.commit()
+
+    def record_delivery_audit(
+        self,
+        *,
+        delivery_id: int,
+        product_id: int,
+        delivery_name: str = None,
+        week_number: str = None,
+        runner_mode: str = None,
+        started_at=None,
+        status: str,
+        total_files: int = 0,
+        docs_upserted: int = 0,
+        docs_deleted: int = 0,
+        docs_skipped: int = 0,
+        error_message: str = None,
+    ) -> None:
+        """Insert one summary row into frontfile_delivery_audit.
+
+        All doc-count fields default to 0 so callers only need to pass
+        the fields they actually have.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO frontfile_delivery_audit (
+                    delivery_id, product_id, delivery_name, week_number,
+                    runner_mode, started_at, status,
+                    total_files, docs_upserted, docs_deleted, docs_skipped,
+                    error_message
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s
+                );
+                """,
+                (
+                    delivery_id, product_id, delivery_name, week_number,
+                    runner_mode, started_at, status,
+                    total_files, docs_upserted, docs_deleted, docs_skipped,
+                    error_message,
+                ),
+            )
+        self.conn.commit()
+        logger.info(
+            f"Delivery audit recorded: delivery_id={delivery_id} week={week_number} "
+            f"status={status} upserted={docs_upserted} deleted={docs_deleted} "
+            f"skipped={docs_skipped}"
+        )

@@ -28,15 +28,29 @@ def resolve_pipeline_log_file(worker_name: str = None, explicit_log_file: str = 
     return log_file
 
 class PipelineOrchestrator:
-    def __init__(self):
+    def __init__(
+        self,
+        product_id: int = None,
+        delivery_id: int = None,
+        delivery_name: str = None,
+        week_number: str = None,
+        runner_mode: str = None,
+    ):
         self.dsn = get_dsn_from_env()
-            
-        self.product_id = int(os.environ.get("EPO_PRODUCT_ID", 14))
-        self.delivery_id = int(os.environ.get("EPO_DELIVERY_ID", 3071))
+
+        # Explicit args take priority over env vars — allows the front-file runner
+        # to pass delivery IDs programmatically without touching the environment.
+        self.product_id = product_id if product_id is not None else int(os.environ.get("EPO_PRODUCT_ID", 14))
+        self.delivery_id = delivery_id if delivery_id is not None else int(os.environ.get("EPO_DELIVERY_ID", 3071))
         self.temp_dir = os.environ.get("EPO_TEMP_DIR", "./tmp_downloads")
-        
+
+        # Audit context — optional, populated by the frontfile_runner
+        self.delivery_name = delivery_name
+        self.week_number = week_number
+        self.runner_mode = runner_mode
+
         os.makedirs(self.temp_dir, exist_ok=True)
-        
+
         self.db = DatabaseManager(self.dsn)
         self.db.connect()
 
@@ -55,24 +69,36 @@ class PipelineOrchestrator:
         self.db.sync_delivery_files(self.product_id, self.delivery_id, files)
         logger.info(f"Successfully synchronized {len(files)} files to the database.")
 
-    def run(self, start_index=1, limit=None, retry_failed=False, batch_size_arg: int = None):
-        """Main execution loop for downloading, extracting, and processing files."""
-        logger.info("Starting pipeline execution loop...")
+    def run(self, start_index=1, limit=None, retry_failed=False, batch_size_arg: int = None) -> bool:
+        """Main execution loop for downloading, extracting, and processing files.
         
+        Returns:
+            True  — all files in this delivery completed successfully.
+            False — one or more files failed (details logged and recorded in DB).
+        """
+        logger.info("Starting pipeline execution loop...")
+        failed_files: list[dict] = []   # accumulates any file records that hit an error
+        started_at = datetime.now()
+
+        # Doc-count tallies (accumulated across all inner ZIPs in this delivery)
+        docs_upserted = 0
+        docs_deleted  = 0
+        docs_skipped  = 0
+
         all_files = self.db.get_all_delivery_files(self.product_id, self.delivery_id)
         if not all_files:
             logger.info("No delivery files found. Pipeline is idle.")
-            return
+            return True
             
         # Apply start-index (1-based index)
         if start_index > 1:
             skip_count = start_index - 1
             if skip_count >= len(all_files):
                 logger.warning(f"start_index {start_index} is greater than total delivery files ({len(all_files)}). Nothing to process.")
-                return
+                return True
             all_files = all_files[skip_count:]
             logger.info(f"Skipped first {skip_count} files. Starting at index {start_index} out of total files.")
-            
+        
         if limit is not None:
             all_files = all_files[:limit]
             logger.info(f"Applying limit: processing {len(all_files)} files.")
@@ -92,10 +118,10 @@ class PipelineOrchestrator:
                 logger.info(f"Skipping already '{status}' file ID {file_id}: {filename}")
                 continue
 
-            # if filename.lower().endswith('.csv'):
-            #     logger.info(f"Skipping front file (non-ZIP): {filename}")
-            #     self.db.update_file_status(file_id, 'COMPLETED')
-            #     continue
+            if filename.lower().endswith('.csv'):
+                logger.info(f"Skipping coherence CSV (not a ZIP): {filename}")
+                self.db.update_file_status(file_id, 'COMPLETED')
+                continue
                 
             if status == 'FAILED' and retry_failed:
                 logger.info(f"Retrying 'FAILED' file ID {file_id}: {filename}")
@@ -160,6 +186,13 @@ class PipelineOrchestrator:
                         if os.path.exists(potential_dtd):
                             dtd_dir = potential_dtd
                             break
+                    if not dtd_dir:
+                        # Some deliveries extract with a subdirectory wrapper
+                        # e.g. extract_dir/docdb_xml_202608_Amend_002/Root/DTDS/
+                        hits = glob.glob(os.path.join(extract_dir, '*', 'Root', 'DTDS'))
+                        if hits:
+                            dtd_dir = hits[0]
+                            logger.info(f"Found DTD directory (nested): {dtd_dir}")
                     
                     if not internal_zips:
                         # Fallback just in case there are bare XML files instead of internal ZIPs
@@ -185,6 +218,13 @@ class PipelineOrchestrator:
                             if first_doc_number is None:
                                 first_doc_number = current_doc_number
                             last_doc_number = current_doc_number
+                            # ── Tally by operation for the audit log ──────────
+                            if doc.operation == 'SKIP':
+                                docs_skipped += 1
+                            elif doc.operation in ('D', 'DV', 'V'):
+                                docs_deleted += 1
+                            else:
+                                docs_upserted += 1
                             batch.append(doc)
                             if len(batch) >= batch_size:
                                 self.db.bulk_upsert_safe(batch, stage_key=inner_zip_name)
@@ -212,15 +252,64 @@ class PipelineOrchestrator:
                 import traceback
                 error_msg = traceback.format_exc()
                 
-                # # Rollback current transaction state before logging FAILED
-                # if hasattr(self.db, 'conn') and self.db.conn:
-                #     self.db.conn.rollback()
-                    
                 self.db.update_file_status(file_id, 'FAILED', error_msg)
+                # Store the short message (first line) alongside filename for the audit row
+                failed_files.append({
+                    'file_id': file_id,
+                    'filename': filename,
+                    'error': str(e).split('\n')[0][:200],  # first line, max 200 chars
+                })
                 
                 # Try to clean up on failure
                 if os.path.exists(extract_dir):
                     shutil.rmtree(extract_dir, ignore_errors=True)
+
+        # ── Delivery-level outcome summary ────────────────────────────────────
+        total_files = len([f for f in all_files if not f['filename'].lower().endswith('.csv')])
+
+        if failed_files:
+            logger.error(
+                f"Delivery {self.delivery_id} finished with {len(failed_files)} FAILED file(s): "
+                + ", ".join(f"[{f['file_id']}] {f['filename']}" for f in failed_files)
+            )
+            self._try_record_audit(
+                status='FAILED', started_at=started_at, total_files=total_files,
+                docs_upserted=docs_upserted, docs_deleted=docs_deleted, docs_skipped=docs_skipped,
+                error_message='; '.join(
+                    f"{f['filename']}: {f.get('error', 'unknown error')}"
+                    for f in failed_files
+                ),
+            )
+            return False
+
+        logger.info(f"Delivery {self.delivery_id} — all files completed successfully.")
+        self._try_record_audit(
+            status='COMPLETED', started_at=started_at, total_files=total_files,
+            docs_upserted=docs_upserted, docs_deleted=docs_deleted, docs_skipped=docs_skipped,
+        )
+        return True
+
+    def _try_record_audit(self, *, status, started_at, total_files,
+                          docs_upserted, docs_deleted, docs_skipped, error_message=None):
+        """Write a delivery audit row. Errors here are logged but never propagate."""
+        try:
+            self.db.record_delivery_audit(
+                delivery_id=self.delivery_id,
+                product_id=self.product_id,
+                delivery_name=self.delivery_name,
+                week_number=self.week_number,
+                runner_mode=self.runner_mode,
+                started_at=started_at,
+                status=status,
+                total_files=total_files,
+                docs_upserted=docs_upserted,
+                docs_deleted=docs_deleted,
+                docs_skipped=docs_skipped,
+                error_message=error_message,
+            )
+        except Exception as audit_err:
+            logger.warning(f"Could not write delivery audit row: {audit_err}")
+
                     
 def main():
     import sys

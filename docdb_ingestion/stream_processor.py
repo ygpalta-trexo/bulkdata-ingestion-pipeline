@@ -1,4 +1,7 @@
 import zipfile
+import html.entities
+import io
+import re
 import lxml.etree as ET
 from typing import Iterator, Dict, Any, Optional
 import logging
@@ -162,20 +165,343 @@ def process_zip_file(zip_path: str, dtd_dir: Optional[str] = None) -> Iterator[E
         logger.error(f"Error processing {zip_path}: {e}")
         raise
 
-def parse_xml_file(xml_path: str) -> Iterator[ExchangeDocument]:
-    context = ET.iterparse(
-        xml_path, 
-        events=("end",), 
-        tag=f"{{{NS['exch']}}}exchange-document",
-        load_dtd=True,   # Must be True to resolve EPO-specific entities (&delta;, &bgr; etc)
-        no_network=True  # DTDs are copied to the same temp dir as the XML by process_zip_file
-    )
-    
-    for event, elem in context:
-        yield extract_document_data(elem)
-        elem.clear() 
-        while elem.getprevious() is not None:
-            del elem.getparent()[0]
+# ── Entity declarations injected into DOCTYPE for EPO XML compatibility ────────
+#
+# Two families of named entities appear in EPO DOCDB XML:
+#
+#   1. HTML5 entities  (&ldquo; &zcaron; &nbsp; …) — undefined in plain XML.
+#   2. ISO SGML entities (&Dgr; &agr; &phgr; …) — defined in docdb-common.dtd.
+#
+# The EPO DTD is only available when the outer delivery ZIP includes a Root/DTDS/
+# directory.  Several delivery weeks omit it, causing lxml to silently skip the
+# SYSTEM reference and leave all ISO entities undefined.
+#
+# Fix: inject BOTH families into the DOCTYPE internal subset so parsing is fully
+# self-contained regardless of whether the external DTD is present.
+# Only the first 8 KB (where DOCTYPE lives) is rewritten; the remainder of the
+# file streams from disk via shutil.copyfileobj — no full-file RAM load.
+
+# ── EPO / ISO SGML entities NOT covered by HTML5 ─────────────────────────────
+# EPO DOCDB uses ISO 8879 SGML character entity sets that predate HTML5.
+# These use a "gr" suffix naming convention (iso-grk1/iso-grk2) instead of the
+# HTML5 names (&delta; vs &dgr;, &Delta; vs &Dgr;).
+_EPO_ISO_ENTITIES: dict[str, str] = {
+    # ── ISO Greek 1 — lowercase ───────────────────────────────────────────────
+    "agr":   "\u03B1",  # α  alpha
+    "bgr":   "\u03B2",  # β  beta
+    "ggr":   "\u03B3",  # γ  gamma
+    "dgr":   "\u03B4",  # δ  delta
+    "egr":   "\u03B5",  # ε  epsilon
+    "zgr":   "\u03B6",  # ζ  zeta
+    "eegr":  "\u03B7",  # η  eta
+    "thgr":  "\u03B8",  # θ  theta
+    "igr":   "\u03B9",  # ι  iota
+    "kgr":   "\u03BA",  # κ  kappa
+    "lgr":   "\u03BB",  # λ  lambda
+    "mgr":   "\u03BC",  # μ  mu
+    "ngr":   "\u03BD",  # ν  nu
+    "xgr":   "\u03BE",  # ξ  xi
+    "ogr":   "\u03BF",  # ο  omicron
+    "pgr":   "\u03C0",  # π  pi
+    "rgr":   "\u03C1",  # ρ  rho
+    "sfgr":  "\u03C2",  # ς  final sigma
+    "sgr":   "\u03C3",  # σ  sigma
+    "tgr":   "\u03C4",  # τ  tau
+    "ugr":   "\u03C5",  # υ  upsilon
+    "phgr":  "\u03C6",  # φ  phi
+    "khgr":  "\u03C7",  # χ  chi
+    "psgr":  "\u03C8",  # ψ  psi
+    "ohgr":  "\u03C9",  # ω  omega
+    # ── ISO Greek 2 — uppercase ───────────────────────────────────────────────
+    "Agr":   "\u0391",  # Α  Alpha
+    "Bgr":   "\u0392",  # Β  Beta
+    "Ggr":   "\u0393",  # Γ  Gamma
+    "Dgr":   "\u0394",  # Δ  Delta
+    "Egr":   "\u0395",  # Ε  Epsilon
+    "Zgr":   "\u0396",  # Ζ  Zeta
+    "EEgr":  "\u0397",  # Η  Eta
+    "THgr":  "\u0398",  # Θ  Theta
+    "Igr":   "\u0399",  # Ι  Iota
+    "Kgr":   "\u039A",  # Κ  Kappa
+    "Lgr":   "\u039B",  # Λ  Lambda
+    "Mgr":   "\u039C",  # Μ  Mu
+    "Ngr":   "\u039D",  # Ν  Nu
+    "Xgr":   "\u039E",  # Ξ  Xi
+    "Ogr":   "\u039F",  # Ο  Omicron
+    "Pgr":   "\u03A0",  # Π  Pi
+    "Rgr":   "\u03A1",  # Ρ  Rho
+    "Sgr":   "\u03A3",  # Σ  Sigma
+    "Tgr":   "\u03A4",  # Τ  Tau
+    "Ugr":   "\u03A5",  # Υ  Upsilon
+    "PHgr":  "\u03A6",  # Φ  Phi
+    "KHgr":  "\u03A7",  # Χ  Chi
+    "PSgr":  "\u03A8",  # Ψ  Psi
+    "OHgr":  "\u03A9",  # Ω  Omega
+    # ── ISO Greek 3 — accented / polytonic Greek ──────────────────────────────
+    "aacgr":   "\u03AC",  # ά
+    "aaegr":   "\u03AE",  # ή
+    "adigr":   "\u03AA",  # Ϊ
+    "aeacgr":  "\u03AD",  # έ
+    "aiacgr":  "\u03AF",  # ί
+    "aidigr":  "\u03CA",  # ϊ
+    "aoacgr":  "\u03CC",  # ό
+    "auacgr":  "\u03CD",  # ύ
+    "audigr":  "\u03CB",  # ϋ
+    "aohacgr": "\u03CE",  # ώ
+    "Aacgr":   "\u0386",  # Ά
+    "Aaegr":   "\u0389",  # Ή
+    "Adigr":   "\u03AB",  # Ϋ
+    "Aeacgr":  "\u0388",  # Έ
+    "Aiacgr":  "\u038A",  # Ί
+    "Aoacgr":  "\u038C",  # Ό
+    "Auacgr":  "\u038E",  # Ύ
+    # ── ISO Numerics — fractions absent from HTML5 ────────────────────────────
+    "half":   "\u00BD",  # ½
+    "frac14": "\u00BC",  # ¼
+    "frac34": "\u00BE",  # ¾
+    "frac13": "\u2153",  # ⅓
+    "frac23": "\u2154",  # ⅔
+    "frac15": "\u2155",  # ⅕
+    "frac25": "\u2156",  # ⅖
+    "frac35": "\u2157",  # ⅗
+    "frac45": "\u2158",  # ⅘
+    "frac16": "\u2159",  # ⅙
+    "frac56": "\u215A",  # ⅚
+    "frac18": "\u215B",  # ⅛
+    "frac38": "\u215C",  # ⅜
+    "frac58": "\u215D",  # ⅝
+    "frac78": "\u215E",  # ⅞
+    # ── ISO spacing / misc symbols ────────────────────────────────────────────
+    "hairsp": "\u200A",  # hair space
+    "numsp":  "\u2007",  # figure space
+    "puncsp": "\u2008",  # punctuation space
+    "emsp13": "\u2004",  # ⅓-em space
+    "emsp14": "\u2005",  # ¼-em space
+    "ohm":    "\u2126",  # Ω Ohm sign (distinct from Greek Omega U+03A9)
+}
+
+
+def _build_html_entity_decls() -> bytes:
+    """Build XML <!ENTITY> declarations covering HTML5 + EPO ISO SGML entities.
+
+    Merge strategy (no duplicates):
+      • HTML5 entities are emitted first (sorted by name).
+      • EPO ISO entities are appended only if the name was not already emitted
+        by the HTML5 pass.
+    In XML the first declaration of a given entity name wins, so HTML5
+    definitions take precedence for any overlap (same codepoints anyway).
+    Entity values use numeric character references (&#{N};) for encoding safety.
+    """
+    import re as _re
+    _valid_xml_name = _re.compile(r"^[a-zA-Z_][\w.\-:]*$")
+
+    seen: set[str] = set()
+    decls: list[bytes] = []
+
+    # ── Pass 1: HTML5 ─────────────────────────────────────────────────────────
+    html5_names = {name.rstrip(";") for name in html.entities.html5.keys() if name.rstrip(";")}
+    # Ensure XML built-in apostrophe entity is covered in uppercase form too.
+    html5_names.add("apos")
+
+    for name in sorted(html5_names):
+        if not _valid_xml_name.match(name):
+            continue
+        if name in seen:
+            continue
+
+        raw_value = html.entities.html5.get(name + ";")
+        if raw_value is None:
+            if name == "apos":
+                raw_value = "'"
+            else:
+                continue
+
+        if isinstance(raw_value, str):
+            chars = raw_value
+        else:
+            chars = "".join(raw_value)
+
+        value = "".join(f"&#{ord(c)};" for c in chars)
+        decls.append(f'<!ENTITY {name} "{value}">'.encode())
+        seen.add(name)
+
+        upper_name = name.upper()
+        if upper_name != name and upper_name not in seen and _valid_xml_name.match(upper_name):
+            decls.append(f'<!ENTITY {upper_name} "{value}">'.encode())
+            seen.add(upper_name)
+
+    # ── Pass 2: EPO ISO SGML (skip anything HTML5 already covered) ────────────
+    for name, char in sorted(_EPO_ISO_ENTITIES.items()):
+        if name in seen:
+            continue
+        seen.add(name)
+        decls.append(f'<!ENTITY {name} "&#{ord(char)};">'.encode())
+
+    return b"".join(decls)
+
+
+_HTML_ENTITY_DECLS: bytes = _build_html_entity_decls()
+
+# Entity names (bytes) that are declared in _HTML_ENTITY_DECLS plus XML built-ins.
+# _make_html_patched_xml extends this with any names found in docdb-entities.dtd.
+_KNOWN_ENTITY_NAMES: frozenset[bytes] = frozenset(
+    re.findall(rb"<!ENTITY ([A-Za-z_][A-Za-z0-9._:-]*)", _HTML_ENTITY_DECLS)
+) | frozenset([b"amp", b"lt", b"gt", b"apos", b"quot"])
+
+_ENTITY_REF_RE = re.compile(rb"&([A-Za-z_][A-Za-z0-9._:-]*);")
+_MAX_ENTITY_LEN = 64
+
+
+def _stream_escape_unknown_entities(
+    src_file, dst_file, known: frozenset, chunk_size: int = 1 << 20
+) -> None:
+    """Stream src_file → dst_file, replacing &name; for unknown entities with &amp;name;."""
+    pending = b""
+    while True:
+        raw = src_file.read(chunk_size)
+        if not raw:
+            break
+        data = pending + raw
+        split = len(data)
+        amp = data.rfind(b"&", max(0, split - _MAX_ENTITY_LEN - 2))
+        if amp != -1 and b";" not in data[amp:]:
+            split = amp
+        to_write, pending = data[:split], data[split:]
+        dst_file.write(_ENTITY_REF_RE.sub(
+            lambda m: m.group(0) if m.group(1) in known else b"&amp;" + m.group(1) + b";",
+            to_write,
+        ))
+    if pending:
+        dst_file.write(_ENTITY_REF_RE.sub(
+            lambda m: m.group(0) if m.group(1) in known else b"&amp;" + m.group(1) + b";",
+            pending,
+        ))
+
+
+def _make_html_patched_xml(xml_path: str) -> str:
+    """
+    Write a sibling temp file whose DOCTYPE is augmented with HTML entity
+    declarations, while preserving any SYSTEM/PUBLIC DTD reference so that
+    EPO-specific entities (&Dgr;, &bgr; …) remain resolvable from the local
+    copy of docdb-common.dtd in the same temp directory.
+
+    Only the DOCTYPE declaration (first 8 KB) is modified; the rest of the file
+    is streamed directly from disk via shutil.copyfileobj, so even 2 GB XML
+    files do not need to be loaded into RAM.
+
+    Returns the path of the patched temp file. The caller is responsible for
+    deleting it when done.
+    """
+    import re as _re
+
+    HEADER_LIMIT = 8192  # DOCTYPE is always within the first 8 KB
+
+    with open(xml_path, "rb") as f:
+        header = f.read(HEADER_LIMIT)
+        rest_offset = f.tell()
+
+    # ── Augment the DOCTYPE internal subset (do NOT replace SYSTEM ref) ────────
+    if b"<!DOCTYPE" in header:
+        if _re.search(rb"<!DOCTYPE[^>]*\[", header):
+            # Has an existing internal subset — append HTML decls before the closing ]
+            patched_header = _re.sub(
+                rb"(\]\s*>)",
+                _HTML_ENTITY_DECLS + rb"\1",
+                header, count=1,
+            )
+        else:
+            # Has SYSTEM/PUBLIC ref only — add internal subset before the closing >
+            patched_header = _re.sub(
+                rb"(<!DOCTYPE[^\[>]*?)(>)",
+                rb"\1 [" + _HTML_ENTITY_DECLS + rb"]\2",
+                header, count=1,
+            )
+    elif b"<?xml" in header:
+        patched_header = _re.sub(
+            rb"(<\?xml[^?]*\?>)",
+            rb"\1\n<!DOCTYPE exchange-documents [" + _HTML_ENTITY_DECLS + rb"]>",
+            header, count=1,
+        )
+    else:
+        patched_header = b"<!DOCTYPE exchange-documents [" + _HTML_ENTITY_DECLS + b"]>\n" + header
+
+    # Build known entity set: hardcoded HTML5+ISO + docdb-entities.dtd if available
+    # (the pipeline copies it to the same temp dir as the XML when the DTDS dir is found).
+    known = _KNOWN_ENTITY_NAMES
+    dtd_path = os.path.join(os.path.dirname(xml_path), "docdb-entities.dtd")
+    if os.path.exists(dtd_path):
+        with open(dtd_path, "rb") as dtd_f:
+            known = known | frozenset(
+                re.findall(rb"<!ENTITY ([A-Za-z_][A-Za-z0-9._:-]*)", dtd_f.read())
+            )
+
+    patched_path = xml_path + "._htmlpatched"
+    with open(patched_path, "wb") as out:
+        out.write(patched_header)
+        with open(xml_path, "rb") as orig:
+            orig.seek(rest_offset)
+            _stream_escape_unknown_entities(orig, out, known)
+
+    return patched_path
+
+
+
+def parse_xml_file(xml_path: str, recover_on_entity_error: bool = False) -> Iterator[ExchangeDocument]:
+    """
+    Parse the XML file, optionally recovering from unknown entity errors by replacing them with a placeholder.
+    If recover_on_entity_error is True, unknown entities are replaced with '�' and a warning is logged.
+    """
+    patched_path = _make_html_patched_xml(xml_path)
+    try:
+        try:
+            context = ET.iterparse(
+                patched_path,
+                events=("end",),
+                tag=f"{{{NS['exch']}}}exchange-document",
+                load_dtd=True,    # resolves EPO-specific entities (&delta;, &bgr;, &Dgr;…)
+                no_network=True,  # DTDs are in the same temp dir as the XML
+            )
+            for event, elem in context:
+                yield extract_document_data(elem)
+                elem.clear()
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
+        except ET.XMLSyntaxError as e:
+            if not recover_on_entity_error or 'Entity' not in str(e):
+                raise
+            logger.warning(f"XMLSyntaxError: {e}. Attempting recovery by replacing unknown entities with '🔷'.")
+            # Fallback: replace all &foo; with U+FFFD and re-parse
+            with open(patched_path, 'rb') as f:
+                xml_bytes = f.read()
+            xml_bytes = re.sub(br'&[A-Za-z0-9_]+;', b'\xef\xbf\xbd', xml_bytes)
+            temp_recovered = patched_path + '.recovered'
+            with open(temp_recovered, 'wb') as f:
+                f.write(xml_bytes)
+            try:
+                context = ET.iterparse(
+                    temp_recovered,
+                    events=("end",),
+                    tag=f"{{{NS['exch']}}}exchange-document",
+                    load_dtd=False,  # Entities are now gone
+                    no_network=True,
+                )
+                for event, elem in context:
+                    yield extract_document_data(elem)
+                    elem.clear()
+                    while elem.getprevious() is not None:
+                        del elem.getparent()[0]
+            finally:
+                try:
+                    os.unlink(temp_recovered)
+                except OSError:
+                    pass
+    finally:
+        try:
+            os.unlink(patched_path)
+        except OSError:
+            pass
+
+
 
 def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     country = elem.get('country', '')
@@ -190,7 +516,7 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     # with NO doc-id. They represent withdrawn publications and must be skipped
     # unless the user explicitly wants to track withdrawn status.
     if status.upper() in ('CV', 'DV'):
-        logger.debug(f"Skipping void document (status={status}): {country}{doc_number}{kind}")
+        logger.info(f"Skipping void document (status={status}): {country}{doc_number}{kind}")
         return ExchangeDocument(
             app_master=ApplicationMaster(app_doc_id=f"VOID_{country}{doc_number}", app_country=country, app_number=doc_number),
             pub_master=DocumentMaster(pub_doc_id=f"VOID_{country}{doc_number}{kind}", app_doc_id=f"VOID_{country}{doc_number}", country=country, doc_number=doc_number, kind_code=kind),
@@ -555,7 +881,7 @@ def extract_document_data(elem: ET.Element) -> ExchangeDocument:
     # Log any unhandled data for debugging
     if pub_extra_data or app_extra_data:
         unhandled = list(pub_extra_data.keys()) + list(app_extra_data.keys())
-        logger.info(f"Document {pub_doc_id} has unhandled fields: {unhandled}")
+        logger.debug(f"Document {pub_doc_id} has unhandled fields: {unhandled}")
         logger.debug(f"Unhandled pub data: {pub_extra_data} | Unhandled app data: {app_extra_data}")
     
     app_master.extra_data = app_extra_data if app_extra_data else {}
