@@ -42,7 +42,7 @@ from docdb_ingestion.pipeline import PipelineOrchestrator, resolve_pipeline_log_
 
 logger = logging.getLogger(__name__)
 
-EPO_API_BASE_URL_DEFAULT = "https://publication-bdds.apps.epo.org/bdds/bdds-bff-service/prod/api"
+EPO_API_BASE_URL_DEFAULT = "https://publication-bdds.apps.epo.org/bdds/bdds-bff-service/prod/api/public"
 
 # Regex that extracts the week token from a delivery name, e.g.
 #   "14.7 DOCDB - EPO worldwide bibliographic data 2026/009 Amend"  →  "2026/009"
