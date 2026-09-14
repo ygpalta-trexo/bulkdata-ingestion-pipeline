@@ -49,6 +49,11 @@ class PipelineOrchestrator:
         self.week_number = week_number
         self.runner_mode = runner_mode
 
+        # Filled in at the end of every run() call. The front-file runner reads
+        # it to build its per-run email report without re-querying the audit
+        # table; run() itself still returns only a success boolean.
+        self.last_run_stats: dict = {}
+
         os.makedirs(self.temp_dir, exist_ok=True)
 
         self.db = DatabaseManager(self.dsn)
@@ -88,6 +93,7 @@ class PipelineOrchestrator:
         all_files = self.db.get_all_delivery_files(self.product_id, self.delivery_id)
         if not all_files:
             logger.info("No delivery files found. Pipeline is idle.")
+            self._set_run_stats(started_at=started_at, total_files=0)
             return True
             
         # Apply start-index (1-based index)
@@ -95,6 +101,7 @@ class PipelineOrchestrator:
             skip_count = start_index - 1
             if skip_count >= len(all_files):
                 logger.warning(f"start_index {start_index} is greater than total delivery files ({len(all_files)}). Nothing to process.")
+                self._set_run_stats(started_at=started_at, total_files=0)
                 return True
             all_files = all_files[skip_count:]
             logger.info(f"Skipped first {skip_count} files. Starting at index {start_index} out of total files.")
@@ -105,8 +112,10 @@ class PipelineOrchestrator:
             
         logger.info(f"Found {len(all_files)} files to process.")
         
-        # Determine effective batch size: CLI arg > env var > default
-        batch_size = int(os.environ.get('DOCDB_BATCH_SIZE', str(batch_size_arg or 1000)))
+        # Determine effective batch size: CLI arg > env var > default.
+        # The env var used to be read first, which made --batch-size a no-op
+        # whenever DOCDB_BATCH_SIZE was set in .env.
+        batch_size = batch_size_arg or int(os.environ.get('DOCDB_BATCH_SIZE', '1000'))
 
         for file_rec in all_files:
             file_id = file_rec['file_id']
@@ -268,6 +277,11 @@ class PipelineOrchestrator:
         total_files = len([f for f in all_files if not f['filename'].lower().endswith('.csv')])
 
         if failed_files:
+            self._set_run_stats(
+                started_at=started_at, total_files=total_files,
+                docs_upserted=docs_upserted, docs_deleted=docs_deleted,
+                docs_skipped=docs_skipped, failed_files=failed_files,
+            )
             logger.error(
                 f"Delivery {self.delivery_id} finished with {len(failed_files)} FAILED file(s): "
                 + ", ".join(f"[{f['file_id']}] {f['filename']}" for f in failed_files)
@@ -283,11 +297,38 @@ class PipelineOrchestrator:
             return False
 
         logger.info(f"Delivery {self.delivery_id} — all files completed successfully.")
+        self._set_run_stats(
+            started_at=started_at, total_files=total_files,
+            docs_upserted=docs_upserted, docs_deleted=docs_deleted,
+            docs_skipped=docs_skipped,
+        )
         self._try_record_audit(
             status='COMPLETED', started_at=started_at, total_files=total_files,
             docs_upserted=docs_upserted, docs_deleted=docs_deleted, docs_skipped=docs_skipped,
         )
         return True
+
+    def _set_run_stats(self, *, started_at, total_files,
+                       docs_upserted=0, docs_deleted=0, docs_skipped=0,
+                       failed_files=None):
+        """Record the tallies from the most recent run() on the instance.
+
+        Set on every exit path of run() so a caller can never read stale
+        numbers from a previous delivery.
+        """
+        self.last_run_stats = {
+            'product_id': self.product_id,
+            'delivery_id': self.delivery_id,
+            'delivery_name': self.delivery_name,
+            'week_number': self.week_number,
+            'started_at': started_at,
+            'finished_at': datetime.now(),
+            'total_files': total_files,
+            'docs_upserted': docs_upserted,
+            'docs_deleted': docs_deleted,
+            'docs_skipped': docs_skipped,
+            'failed_files': failed_files or [],
+        }
 
     def _try_record_audit(self, *, status, started_at, total_files,
                           docs_upserted, docs_deleted, docs_skipped, error_message=None):

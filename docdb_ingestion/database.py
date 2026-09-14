@@ -74,9 +74,16 @@ class DatabaseManager:
         self.dsn = dsn
         self.conn = None
 
-    def connect(self):
+    def connect(self, init_schema: bool = True):
+        """Open the connection.
+
+        :param init_schema: run the CREATE TABLE/INDEX/partition bootstrap.
+            Pass False for read-only callers — the front-file runner's planning
+            query and any dry run must not issue DDL just to read a few counts.
+        """
         self.conn = psycopg.connect(self.dsn, row_factory=dict_row)
-        self.init_schema()
+        if init_schema:
+            self.init_schema()
 
     def close(self):
         if self.conn:
@@ -377,6 +384,44 @@ class DatabaseManager:
                 (product_id, delivery_id),
             )
             return [dict(row) for row in cur.fetchall()]
+
+    def get_delivery_status_summary(
+        self, product_id: int, delivery_ids: List[int]
+    ) -> Dict[int, Dict[str, int]]:
+        """Per-delivery file-status counts for a batch of deliveries.
+
+        The front-file runner calls this before touching the EPO API or the
+        ingestion pipeline, so it can tell apart deliveries that were never
+        synced, ones with outstanding work, and ones already fully processed.
+
+        Deliveries with no delivery_files rows are absent from the result —
+        absence means "never synced", not "nothing to do".
+        """
+        if not delivery_ids:
+            return {}
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT delivery_id,
+                       COUNT(*)                                     AS total,
+                       COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                       COUNT(*) FILTER (WHERE status = 'FAILED')    AS failed
+                FROM delivery_files
+                WHERE product_id = %s AND delivery_id = ANY(%s)
+                GROUP BY delivery_id;
+                """,
+                (product_id, list(delivery_ids)),
+            )
+            return {
+                row["delivery_id"]: {
+                    "total": row["total"],
+                    "completed": row["completed"],
+                    "failed": row["failed"],
+                    "outstanding": row["total"] - row["completed"],
+                }
+                for row in cur.fetchall()
+            }
 
     def update_file_status(self, file_id: int, status: str, error_message: str = None):
         with self.conn.cursor() as cur:
