@@ -82,6 +82,11 @@ EPO_PRODUCT_ID=14
 EPO_DELIVERY_ID=3071
 EPO_API_BASE_URL=https://publication.b2b.epo.org/b2b/bulk-downloads/v1/
 EPO_TEMP_DIR=./tmp_downloads
+# Optional, for servers: read host/port/user/password from AWS Secrets Manager.
+# The database name still comes from POSTGRES_DB. See docs/server_run_guide.md.
+# USE_SECRET_MANAGER=true
+# DB_SECRET_NAME=<secret name or ARN>
+# AWS_REGION=<region>
 ```
 3. Initialize schemas via `python setup_db.py`.
 Centralized auto-rolling logs will instantly route logic tracing to `logs/YYYY-MM-DD/pipeline.log`.

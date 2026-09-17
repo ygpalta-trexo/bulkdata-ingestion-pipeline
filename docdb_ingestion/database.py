@@ -1,5 +1,6 @@
 import logging
 import os
+import urllib.parse
 from typing import Any, Dict, List
 
 import psycopg
@@ -8,6 +9,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from .aws_secrets import clear_cache as clear_secret_cache, get_secret
 from .models import ExchangeDocument
 
 logger = logging.getLogger(__name__)
@@ -51,8 +53,19 @@ def get_dsn_from_env() -> str:
     Construct DSN explicitly from .env components to prevent
     stray DATABASE_URL environment variables in the user's shell
     from overriding the intended environment mapping.
+
+    With USE_SECRET_MANAGER=true, host/port/user/password come from the AWS
+    Secrets Manager secret instead (see _dsn_from_secret); the database name
+    still comes from POSTGRES_DB. The pipeline, the front-file runner and the
+    utility scripts all resolve their DSN here, so this is the one switch for
+    all of them (merge_fast.py's RDS target is the exception: it reads RDS_*).
     """
     load_dotenv(override=True)
+
+    # Parsed exactly like the DRM scripts, so one .env value means the same
+    # thing in both code-bases: only "true" (any case) turns it on.
+    if os.getenv("USE_SECRET_MANAGER", "false").lower() == "true":
+        return _dsn_from_secret()
 
     user = os.getenv("POSTGRES_USER", "postgres")
     password = os.getenv("POSTGRES_PASSWORD", "password")
@@ -69,6 +82,80 @@ def get_dsn_from_env() -> str:
     )
 
 
+# DSNs built from the AWS secret in this process. DatabaseManager.connect()
+# refetches the secret only for these, so an explicit --dsn or merge_fast.py's
+# RDS_* target never triggers an AWS call.
+_SECRET_DSNS = set()
+
+
+def _dsn_from_secret() -> str:
+    """
+    Build the DSN from the AWS secret's credentials plus POSTGRES_DB.
+
+    DATABASE_URL and POSTGRES_HOST/USER/PASSWORD are deliberately ignored: a
+    leftover value must not silently bypass the secret. POSTGRES_PORT is used
+    only when the secret has no port.
+
+    User and password are percent-encoded because generated passwords often
+    contain characters (@ : / # ? %, spaces) that make a plain postgresql://
+    URL unparseable. The URL form is kept because setup_db.py logs everything
+    after the last '@' as the connection target; a key=value conninfo string
+    would put the password into that log line.
+    """
+    dbname = os.getenv("POSTGRES_DB")
+    if not dbname:
+        raise RuntimeError("POSTGRES_DB is not set (required when USE_SECRET_MANAGER=true)")
+
+    secret_name = os.getenv("DB_SECRET_NAME")
+    secret = get_secret(secret_name, os.getenv("AWS_REGION"))
+
+    # Same keys the DRM scripts accept: RDS-managed secrets use the lowercase
+    # names, hand-made secrets often use the uppercase ones.
+    host = secret.get("host") or secret.get("DB_HOST")
+    user = secret.get("username") or secret.get("DB_USER")
+    password = secret.get("password") or secret.get("DB_PASSWORD")
+    port = secret.get("port") or secret.get("DB_PORT") or os.getenv("POSTGRES_PORT") or 5432
+
+    missing = [
+        name
+        for name, value in (("host", host), ("username", user), ("password", password))
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"AWS secret '{secret_name}' is missing: {', '.join(missing)}")
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"Invalid database port from AWS secret or POSTGRES_PORT: {port!r}"
+        ) from None
+
+    # quote(), not quote_plus(): libpq decodes %XX but not '+', so a space
+    # encoded as '+' would reach Postgres as a literal '+'.
+    encoded_user = urllib.parse.quote(str(user), safe="")
+    encoded_password = urllib.parse.quote(str(password), safe="")
+    dsn = f"postgresql://{encoded_user}:{encoded_password}@{host}:{port}/{dbname}"
+    _SECRET_DSNS.add(dsn)
+    return dsn
+
+
+def _refresh_dsn_from_secret() -> str:
+    """Forget the cached secret and rebuild the DSN from a fresh AWS fetch."""
+    clear_secret_cache()
+    return _dsn_from_secret()
+
+
+def _is_password_auth_failure(error: psycopg.OperationalError) -> bool:
+    """True when Postgres rejected the password while connecting.
+
+    psycopg attaches no SQLSTATE to connection-time errors (checked on psycopg
+    3.3), so this matches the server's message. It assumes the server reports
+    errors in English, which is the RDS default.
+    """
+    return "password authentication failed" in str(error)
+
+
 class DatabaseManager:
     def __init__(self, dsn: str):
         self.dsn = dsn
@@ -80,8 +167,28 @@ class DatabaseManager:
         :param init_schema: run the CREATE TABLE/INDEX/partition bootstrap.
             Pass False for read-only callers — the front-file runner's planning
             query and any dry run must not issue DDL just to read a few counts.
+
+        If the DSN came from the AWS secret and Postgres rejects its password,
+        the secret is fetched again and the connection retried once, but only
+        when the secret now holds different credentials. That keeps a long run
+        going across a secret rotation; later connections then get the fresh
+        credentials from the cache. Anything else is raised unchanged.
         """
-        self.conn = psycopg.connect(self.dsn, row_factory=dict_row)
+        try:
+            self.conn = psycopg.connect(self.dsn, row_factory=dict_row)
+        except psycopg.OperationalError as error:
+            if self.dsn not in _SECRET_DSNS or not _is_password_auth_failure(error):
+                raise
+            fresh_dsn = _refresh_dsn_from_secret()
+            if fresh_dsn == self.dsn:
+                # The secret has not changed, so the password is simply wrong.
+                raise
+            logger.warning(
+                "Postgres rejected the cached AWS secret credentials; fetched the "
+                "secret again and retrying the connection once."
+            )
+            self.dsn = fresh_dsn
+            self.conn = psycopg.connect(self.dsn, row_factory=dict_row)
         if init_schema:
             self.init_schema()
 

@@ -6,7 +6,7 @@ import openpyxl
 from typing import List, Dict
 from dotenv import load_dotenv
 
-from docdb_ingestion.database import DatabaseManager
+from docdb_ingestion.database import DatabaseManager, get_dsn_from_env
 from query_biblio import fetch_full_biblio
 
 def fetch_top_pubs(db, limit: int = 100) -> List[Dict]:
@@ -176,12 +176,7 @@ def main():
     parser.add_argument("--output", default="docdb_sample.xlsx", help="Output Excel filename")
     args = parser.parse_args()
 
-    from query_biblio import get_dsn
-
-    db_url = get_dsn()
-    if not db_url:
-        print("ERROR: DATABASE_URL not set in environment or .env file.")
-        return
+    db_url = get_dsn_from_env()
 
     db = DatabaseManager(db_url)
     db.connect()

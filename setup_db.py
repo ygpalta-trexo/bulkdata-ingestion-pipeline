@@ -1,7 +1,6 @@
-import os
 import logging
 from dotenv import load_dotenv
-from docdb_ingestion.database import DatabaseManager
+from docdb_ingestion.database import DatabaseManager, get_dsn_from_env
 
 # Load environment variables from .env file
 load_dotenv()
@@ -9,28 +8,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("setup_db")
 
-def get_dsn():
-    """
-    Construct DSN from environment variables.
-    prio: DATABASE_URL > Component vars
-    """
-    dsn = os.getenv("DATABASE_URL")
-    if dsn:
-        return dsn
-    
-    user = os.getenv("POSTGRES_USER", "postgres")
-    password = os.getenv("POSTGRES_PASSWORD", "password")
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    dbname = os.getenv("POSTGRES_DB", "docdb")
-    
-    return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-
 def main():
-    dsn = get_dsn()
-    logger.info(f"Connecting to database at {dsn.split('@')[-1]}...") # Obscure creds
-    
     try:
+        # Resolve the DSN exactly as the pipeline and the front-file runner do,
+        # so setup always prepares the database they will read, including when
+        # credentials come from AWS Secrets Manager (USE_SECRET_MANAGER=true).
+        dsn = get_dsn_from_env()
+        logger.info(f"Connecting to database at {dsn.split('@')[-1]}...") # Obscure creds
+
         db = DatabaseManager(dsn)
         db.connect() # This calls init_schema() internally
         db.close()

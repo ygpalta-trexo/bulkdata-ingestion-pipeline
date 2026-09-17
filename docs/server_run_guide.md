@@ -22,6 +22,23 @@ cp .env.example .env
 # Edit .env with your PostgreSQL connection and any required secrets
 ```
 
+### Database credentials from AWS Secrets Manager
+
+On EC2 you can keep the database credentials in AWS Secrets Manager instead of `.env`:
+
+```
+USE_SECRET_MANAGER=true
+DB_SECRET_NAME=<secret name or ARN>
+AWS_REGION=<region the secret lives in>
+POSTGRES_DB=bulk-data               # the database name still comes from .env
+```
+
+The secret must be a JSON object with `host`, `username` and `password`, and optionally `port`. The uppercase keys `DB_HOST`, `DB_USER`, `DB_PASSWORD` and `DB_PORT` also work; this is the same shape the DRM scripts read. With the flag on, `POSTGRES_HOST`, `POSTGRES_USER`, `POSTGRES_PASSWORD` and `DATABASE_URL` are ignored, and `POSTGRES_PORT` is used only if the secret has no port. Credentials are fetched once per process. If Postgres later rejects them, for example because the secret rotated during a long run, the secret is fetched again and that connection is retried once.
+
+AWS access comes from the instance role, which needs `secretsmanager:GetSecretValue` on the secret, plus `kms:Decrypt` if the secret is encrypted with a customer-managed KMS key.
+
+`merge_fast.py` still reads its RDS target from the `RDS_*` variables. Run it with `USE_SECRET_MANAGER=false`: with the flag on, its local source would resolve to the secret's database.
+
 Validate the install before running the pipeline:
 
 ```bash
